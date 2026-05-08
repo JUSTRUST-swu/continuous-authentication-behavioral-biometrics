@@ -20,6 +20,15 @@ def _std_or_nan(values):
     return float(np.std(values, ddof=1))
 
 
+def _clip_1_99_percentile(values):
+    """1~99 percentile clipping on a 1d array; 2+ samples required to alter bounds."""
+    arr = np.asarray(values, dtype=float)
+    if arr.size < 2:
+        return arr
+    lo, hi = np.percentile(arr, [1.0, 99.0])
+    return np.clip(arr, lo, hi)
+
+
 def load_events(path):
     """
     Load JSONL events from file.
@@ -230,6 +239,8 @@ def extract_keyboard_features(events):
 def extract_mouse_features(events):
     """
     Build mouse-derived time series used by each sliding window.
+    Raw segment velocities (px/s) are stored; each window applies 1~99% clipping on positive
+    velocities in that window, then velocity_mean / velocity_std use ln(velocity).
     Anchors:
     - velocity/movement_distance: second mousemove time
     - acceleration: second velocity sample time (v2 time)
@@ -353,6 +364,8 @@ def _filter_by_window(values, anchors, w_start, w_end):
 def compute_window_features(events, keyboard_data, mouse_data, window_start, window_end, window_size):
     """
     Compute all requested features for one window.
+    velocity_mean / velocity_std: per-window 1~99% clipped positive velocities (px/s), then ln,
+    then mean and sample std of those log values.
     """
     row = {
         "window_start": window_start,
@@ -371,12 +384,19 @@ def compute_window_features(events, keyboard_data, mouse_data, window_start, win
     row["flight_mean"] = _mean_or_nan(flight_w)
     row["flight_std"] = _std_or_nan(flight_w)
 
-    # Mouse features
+    # Mouse features: 1~99% clip in window, then ln(velocity px/s), then mean / std
     velocity_w = _filter_by_window(
         mouse_data["velocity_values"], mouse_data["velocity_anchor_times"], window_start, window_end
     )
-    row["velocity_mean"] = _mean_or_nan(velocity_w)
-    row["velocity_std"] = _std_or_nan(velocity_w)
+    v_pos = [v for v in velocity_w if v > 0]
+    if not v_pos:
+        row["velocity_mean"] = np.nan
+        row["velocity_std"] = np.nan
+    else:
+        v_clipped = _clip_1_99_percentile(v_pos)
+        log_vel = np.log(v_clipped).tolist()
+        row["velocity_mean"] = _mean_or_nan(log_vel)
+        row["velocity_std"] = _std_or_nan(log_vel)
 
     return row
 
@@ -528,8 +548,12 @@ def plot_feature_histograms(df, output_dir="histograms", time_bin_ms=1.0):
             plt.title(f"Histogram: {col} ({time_bin_ms:g}ms bins)")
         else:
             plt.hist(values, bins=30, edgecolor="black", alpha=0.8)
-            plt.xlabel(col)
-            plt.title(f"Histogram: {col}")
+            if col in ("velocity_mean", "velocity_std"):
+                plt.xlabel(f"{col} (ln px/s)")
+                plt.title(f"Histogram: {col} (log, 1-99 pct clip per window)")
+            else:
+                plt.xlabel(col)
+                plt.title(f"Histogram: {col}")
 
         plt.ylabel("count")
         plt.tight_layout()
