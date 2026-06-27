@@ -1,0 +1,571 @@
+{
+  "session": {
+    "id": "session-1782543492738-1b139b",
+    "started_at": "2026-06-27T06:58:12.738Z",
+    "ended_at": "2026-06-27T06:58:23.136Z",
+    "monitor_width": 1707,
+    "monitor_height": 1067,
+    "task_completed": true,
+    "all_tasks_completed": true,
+    "current_task_index": 2,
+    "total_tasks": 3,
+    "server_endpoint": "http://127.0.0.1:3000/logs",
+    "last_task_completed_at": "2026-06-27T06:58:20.597Z",
+    "completed_at": "2026-06-27T06:58:21.253Z",
+    "finalized_at": "2026-06-27T06:58:23.136Z"
+  },
+  "task": null,
+  "task_events": [
+    {
+      "Event": "task assigned",
+      "Epoch": 1782543492743,
+      "Detail": {
+        "task_id": "type-target-text",
+        "task_type": "text_input"
+      }
+    },
+    {
+      "Event": "task completed",
+      "Epoch": 1782543496631,
+      "Detail": {
+        "task_id": "type-target-text",
+        "typed_text": "CODEX 2026"
+      }
+    },
+    {
+      "Event": "task assigned",
+      "Epoch": 1782543497288,
+      "Detail": {
+        "task_id": "click-blue-button",
+        "task_type": "button_click"
+      }
+    },
+    {
+      "Event": "task completed",
+      "Epoch": 1782543498389,
+      "Detail": {
+        "task_id": "click-blue-button",
+        "clicked": "TARGET BUTTON"
+      }
+    },
+    {
+      "Event": "task assigned",
+      "Epoch": 1782543499048,
+      "Detail": {
+        "task_id": "drag-card-to-target",
+        "task_type": "drag"
+      }
+    },
+    {
+      "Event": "drag started",
+      "Epoch": 1782543500019,
+      "Detail": {
+        "task_id": "drag-card-to-target"
+      }
+    },
+    {
+      "Event": "task completed",
+      "Epoch": 1782543500597,
+      "Detail": {
+        "task_id": "drag-card-to-target",
+        "dropped": true
+      }
+    },
+    {
+      "Event": "all tasks completed",
+      "Epoch": 1782543501253,
+      "Detail": {
+        "total_tasks": 3
+      }
+    },
+    {
+      "Event": "measurement saved",
+      "Epoch": 1782543503136,
+      "Detail": {
+        "task_completed": true,
+        "all_tasks_completed": true
+      }
+    }
+  ],
+  "key_events": [
+    {
+      "Event": "pressed",
+      "Epoch": 1782543493572,
+      "Key": "Shift"
+    },
+    {
+      "Event": "pressed",
+      "Epoch": 1782543493706,
+      "Key": "Process"
+    },
+    {
+      "Event": "released",
+      "Epoch": 1782543493812,
+      "Key": "Process"
+    },
+    {
+      "Event": "released",
+      "Epoch": 1782543493819,
+      "Key": "Shift"
+    },
+    {
+      "Event": "released",
+      "Epoch": 1782543493820,
+      "Key": "Process"
+    },
+    {
+      "Event": "released",
+      "Epoch": 1782543493823,
+      "Key": "c"
+    },
+    {
+      "Event": "pressed",
+      "Epoch": 1782543494249,
+      "Key": "Process"
+    },
+    {
+      "Event": "released",
+      "Epoch": 1782543494339,
+      "Key": "Process"
+    },
+    {
+      "Event": "released",
+      "Epoch": 1782543494344,
+      "Key": "HangulMode"
+    },
+    {
+      "Event": "pressed",
+      "Epoch": 1782543494407,
+      "Key": "Backspace"
+    },
+    {
+      "Event": "released",
+      "Epoch": 1782543494550,
+      "Key": "Backspace"
+    },
+    {
+      "Event": "pressed",
+      "Epoch": 1782543494646,
+      "Key": "Shift"
+    },
+    {
+      "Event": "pressed",
+      "Epoch": 1782543494716,
+      "Key": "C"
+    },
+    {
+      "Event": "pressed",
+      "Epoch": 1782543494846,
+      "Key": "O"
+    },
+    {
+      "Event": "released",
+      "Epoch": 1782543494858,
+      "Key": "C"
+    },
+    {
+      "Event": "released",
+      "Epoch": 1782543494966,
+      "Key": "O"
+    },
+    {
+      "Event": "pressed",
+      "Epoch": 1782543495062,
+      "Key": "D"
+    },
+    {
+      "Event": "released",
+      "Epoch": 1782543495117,
+      "Key": "D"
+    },
+    {
+      "Event": "pressed",
+      "Epoch": 1782543495167,
+      "Key": "E"
+    },
+    {
+      "Event": "released",
+      "Epoch": 1782543495258,
+      "Key": "E"
+    },
+    {
+      "Event": "pressed",
+      "Epoch": 1782543495381,
+      "Key": "X"
+    },
+    {
+      "Event": "released",
+      "Epoch": 1782543495520,
+      "Key": "X"
+    },
+    {
+      "Event": "released",
+      "Epoch": 1782543495571,
+      "Key": "Shift"
+    },
+    {
+      "Event": "pressed",
+      "Epoch": 1782543495640,
+      "Key": "Space"
+    },
+    {
+      "Event": "released",
+      "Epoch": 1782543495690,
+      "Key": "Space"
+    },
+    {
+      "Event": "pressed",
+      "Epoch": 1782543495974,
+      "Key": "2"
+    },
+    {
+      "Event": "released",
+      "Epoch": 1782543496083,
+      "Key": "2"
+    },
+    {
+      "Event": "pressed",
+      "Epoch": 1782543496111,
+      "Key": "0"
+    },
+    {
+      "Event": "pressed",
+      "Epoch": 1782543496165,
+      "Key": "2"
+    },
+    {
+      "Event": "released",
+      "Epoch": 1782543496203,
+      "Key": "0"
+    },
+    {
+      "Event": "released",
+      "Epoch": 1782543496265,
+      "Key": "2"
+    },
+    {
+      "Event": "pressed",
+      "Epoch": 1782543496623,
+      "Key": "6"
+    },
+    {
+      "Event": "released",
+      "Epoch": 1782543496740,
+      "Key": "6"
+    }
+  ],
+  "mouse_events": [
+    {
+      "Event": "movement",
+      "Epoch": 1782543492953,
+      "Coordinates": [
+        262,
+        151
+      ]
+    },
+    {
+      "Event": "movement",
+      "Epoch": 1782543493009,
+      "Coordinates": [
+        564,
+        155
+      ]
+    },
+    {
+      "Event": "movement",
+      "Epoch": 1782543493064,
+      "Coordinates": [
+        838,
+        261
+      ]
+    },
+    {
+      "Event": "movement",
+      "Epoch": 1782543497248,
+      "Coordinates": [
+        865,
+        292
+      ]
+    },
+    {
+      "Event": "movement",
+      "Epoch": 1782543497303,
+      "Coordinates": [
+        860,
+        301
+      ]
+    },
+    {
+      "Event": "movement",
+      "Epoch": 1782543497356,
+      "Coordinates": [
+        857,
+        309
+      ]
+    },
+    {
+      "Event": "movement",
+      "Epoch": 1782543497409,
+      "Coordinates": [
+        853,
+        315
+      ]
+    },
+    {
+      "Event": "movement",
+      "Epoch": 1782543497460,
+      "Coordinates": [
+        852,
+        318
+      ]
+    },
+    {
+      "Event": "movement",
+      "Epoch": 1782543497510,
+      "Coordinates": [
+        851,
+        320
+      ]
+    },
+    {
+      "Event": "movement",
+      "Epoch": 1782543497566,
+      "Coordinates": [
+        850,
+        324
+      ]
+    },
+    {
+      "Event": "movement",
+      "Epoch": 1782543497620,
+      "Coordinates": [
+        851,
+        327
+      ]
+    },
+    {
+      "Event": "movement",
+      "Epoch": 1782543497675,
+      "Coordinates": [
+        876,
+        327
+      ]
+    },
+    {
+      "Event": "movement",
+      "Epoch": 1782543497731,
+      "Coordinates": [
+        895,
+        330
+      ]
+    },
+    {
+      "Event": "movement",
+      "Epoch": 1782543497802,
+      "Coordinates": [
+        901,
+        335
+      ]
+    },
+    {
+      "Event": "left press",
+      "Epoch": 1782543498158,
+      "Coordinates": [
+        901,
+        337
+      ]
+    },
+    {
+      "Event": "left release",
+      "Epoch": 1782543498380,
+      "Coordinates": [
+        901,
+        337
+      ]
+    },
+    {
+      "Event": "movement",
+      "Epoch": 1782543499574,
+      "Coordinates": [
+        900,
+        341
+      ]
+    },
+    {
+      "Event": "movement",
+      "Epoch": 1782543499626,
+      "Coordinates": [
+        881,
+        369
+      ]
+    },
+    {
+      "Event": "left press",
+      "Epoch": 1782543499800,
+      "Coordinates": [
+        880,
+        371
+      ]
+    },
+    {
+      "Event": "movement",
+      "Epoch": 1782543500006,
+      "Coordinates": [
+        884,
+        371
+      ]
+    },
+    {
+      "Event": "movement",
+      "Epoch": 1782543500608,
+      "Coordinates": [
+        1169,
+        382
+      ]
+    },
+    {
+      "Event": "movement",
+      "Epoch": 1782543501128,
+      "Coordinates": [
+        1155,
+        381
+      ]
+    },
+    {
+      "Event": "movement",
+      "Epoch": 1782543501182,
+      "Coordinates": [
+        888,
+        303
+      ]
+    },
+    {
+      "Event": "movement",
+      "Epoch": 1782543501232,
+      "Coordinates": [
+        653,
+        229
+      ]
+    },
+    {
+      "Event": "movement",
+      "Epoch": 1782543501490,
+      "Coordinates": [
+        604,
+        227
+      ]
+    },
+    {
+      "Event": "movement",
+      "Epoch": 1782543501543,
+      "Coordinates": [
+        498,
+        230
+      ]
+    },
+    {
+      "Event": "movement",
+      "Epoch": 1782543501595,
+      "Coordinates": [
+        394,
+        215
+      ]
+    },
+    {
+      "Event": "movement",
+      "Epoch": 1782543501648,
+      "Coordinates": [
+        374,
+        197
+      ]
+    },
+    {
+      "Event": "movement",
+      "Epoch": 1782543501701,
+      "Coordinates": [
+        370,
+        165
+      ]
+    },
+    {
+      "Event": "movement",
+      "Epoch": 1782543501751,
+      "Coordinates": [
+        374,
+        144
+      ]
+    },
+    {
+      "Event": "movement",
+      "Epoch": 1782543501808,
+      "Coordinates": [
+        376,
+        131
+      ]
+    },
+    {
+      "Event": "movement",
+      "Epoch": 1782543501864,
+      "Coordinates": [
+        397,
+        118
+      ]
+    },
+    {
+      "Event": "movement",
+      "Epoch": 1782543502007,
+      "Coordinates": [
+        404,
+        117
+      ]
+    },
+    {
+      "Event": "movement",
+      "Epoch": 1782543502064,
+      "Coordinates": [
+        406,
+        124
+      ]
+    },
+    {
+      "Event": "left press",
+      "Epoch": 1782543502306,
+      "Coordinates": [
+        406,
+        128
+      ]
+    },
+    {
+      "Event": "left release",
+      "Epoch": 1782543502523,
+      "Coordinates": [
+        406,
+        128
+      ]
+    },
+    {
+      "Event": "movement",
+      "Epoch": 1782543502686,
+      "Coordinates": [
+        406,
+        129
+      ]
+    },
+    {
+      "Event": "left press",
+      "Epoch": 1782543502892,
+      "Coordinates": [
+        398,
+        137
+      ]
+    },
+    {
+      "Event": "left release",
+      "Epoch": 1782543503120,
+      "Coordinates": [
+        398,
+        137
+      ]
+    }
+  ]
+}
