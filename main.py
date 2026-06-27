@@ -1,4 +1,5 @@
 import glob
+import json
 import logging
 import math
 import os
@@ -10,11 +11,13 @@ import pandas as pd
 from scipy import stats
 
 from visualize import (
+    apply_clip_log_transform,
     build_windows,
     compute_window_features,
     extract_keyboard_features,
     extract_mouse_features,
     load_raw_kmt_user_events,
+    split_events_by_gap,
 )
 
 
@@ -28,66 +31,7 @@ FEATURE_COLUMNS = [
 ]
 
 
-def classify_interval_gap(gap_seconds):
-    """
-    Classify event interval by policy.
-    """
-    if gap_seconds < 0:
-        return "invalid"
-    if gap_seconds <= 1.0:
-        return "normal_interval"
-    if gap_seconds < 10.0:
-        return "pause_feature"
-    if gap_seconds < 30.0:
-        return "idle_or_sequence_break"
-    return "new_session_break"
-
-
-def split_events_by_gap(events, sequence_break_seconds=10.0, session_break_seconds=30.0):
-    """
-    Split sorted events into contiguous segments by interval policy.
-    - gap >= sequence_break_seconds: sequence break
-    - gap >= session_break_seconds: new session break
-
-    Returns:
-    - segments: list of event segments
-    - gap_stats: category counts by interval policy
-    """
-    if not events:
-        return [], {
-            "normal_interval": 0,
-            "pause_feature": 0,
-            "idle_or_sequence_break": 0,
-            "new_session_break": 0,
-            "invalid": 0,
-        }
-
-    segments = []
-    gap_stats = {
-        "normal_interval": 0,
-        "pause_feature": 0,
-        "idle_or_sequence_break": 0,
-        "new_session_break": 0,
-        "invalid": 0,
-    }
-    current = [events[0]]
-    for i in range(1, len(events)):
-        prev_t = events[i - 1]["t"]
-        cur = events[i]
-        gap = cur["t"] - prev_t
-        gap_type = classify_interval_gap(gap)
-        gap_stats[gap_type] += 1
-
-        if gap >= session_break_seconds or gap >= sequence_break_seconds:
-            segments.append(current)
-            current = [cur]
-        else:
-            current.append(cur)
-    segments.append(current)
-    return segments, gap_stats
-
-
-def setup_logger(log_path="evaluate.log"):
+def setup_logger(log_path="results/main/logs/evaluate.log"):
     """Create console + file logger for long-running evaluation."""
     logger = logging.getLogger("evaluate")
     if logger.handlers:
@@ -100,11 +44,18 @@ def setup_logger(log_path="evaluate.log"):
     stream_handler.setFormatter(formatter)
     logger.addHandler(stream_handler)
 
+    _ensure_parent_dir(log_path)
     file_handler = logging.FileHandler(log_path, encoding="utf-8")
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
     return logger
+
+
+def _ensure_parent_dir(path):
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
 
 
 def build_feature_df_from_events(
@@ -141,33 +92,146 @@ def build_feature_df_from_events(
                 )
             )
 
-    return pd.DataFrame(rows, columns=columns)
+    df = pd.DataFrame(rows, columns=columns)
+    return apply_clip_log_transform(df, FEATURE_COLUMNS)
+
+
+def resolve_preprocessed_json_path(raw_user_json_path, preprocessed_dir):
+    """
+    Resolve preprocessed JSON path under preprocessed_dir.
+
+    Candidate mapping order:
+    - raw_kmt_user_XXXX.json -> preprocessed_kmt_user_XXXX.json
+    - any_name.json -> preprocessed_any_name.json
+    - any_name.json -> any_name.json
+
+    Returns first existing candidate; otherwise None.
+    """
+    if not preprocessed_dir or not str(preprocessed_dir).strip():
+        return None
+    base = os.path.basename(raw_user_json_path)
+    if not base.endswith(".json"):
+        return None
+
+    candidates = []
+    if base.startswith("raw_kmt_user_"):
+        candidates.append(base.replace("raw_kmt_", "preprocessed_kmt_", 1))
+    candidates.append(f"preprocessed_{base}")
+    candidates.append(base)
+
+    root = str(preprocessed_dir).strip()
+    seen = set()
+    for name in candidates:
+        if name in seen:
+            continue
+        seen.add(name)
+        candidate = os.path.join(root, name)
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def build_feature_df_from_preprocessed_json(
+    preprocessed_json_path,
+    window_size=5.0,
+    stride=1.0,
+):
+    """
+    Build window feature rows from preprocess.py output (segmented keyboard/mouse series).
+    Windowing uses each segment's [t_first, t_last] timeline (same as raw segment bounds).
+    """
+    columns = ["window_start", "window_end"] + FEATURE_COLUMNS
+    with open(preprocessed_json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if int(data.get("schema_version", 1)) != 1:
+        raise ValueError(f"Unsupported preprocess schema_version in {preprocessed_json_path}")
+
+    segments = data.get("segments")
+    if not isinstance(segments, list):
+        segments = []
+
+    rows = []
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        kb = seg.get("keyboard_data")
+        md = seg.get("mouse_data")
+        if not isinstance(kb, dict) or not isinstance(md, dict):
+            continue
+        try:
+            t0 = float(seg["t_first"])
+            t1 = float(seg["t_last"])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        pseudo_events = [{"t": t0}, {"t": t1}]
+        windows = build_windows(pseudo_events, window_size=window_size, stride=stride)
+        for window_start, window_end in windows:
+            rows.append(
+                compute_window_features(
+                    events=pseudo_events,
+                    keyboard_data=kb,
+                    mouse_data=md,
+                    window_start=window_start,
+                    window_end=window_end,
+                    window_size=window_size,
+                )
+            )
+
+    df = pd.DataFrame(rows, columns=columns)
+    return apply_clip_log_transform(df, FEATURE_COLUMNS)
 
 
 def build_feature_df_for_user(
     raw_user_json_path,
+    preprocessed_dir="results/preprocessed_logs",
     window_size=5.0,
     stride=1.0,
     sequence_break_seconds=10.0,
     session_break_seconds=30.0,
+    logger=None,
 ):
     """
     Build feature rows for one user using true_data only.
-    """
-    try:
-        events = load_raw_kmt_user_events(raw_user_json_path, data_group="true_data")
-    except ValueError:
-        return pd.DataFrame(columns=["window_start", "window_end", *FEATURE_COLUMNS, "data_group"])
 
-    frame = build_feature_df_from_events(
-        events,
-        window_size=window_size,
-        stride=stride,
-        sequence_break_seconds=sequence_break_seconds,
-        session_break_seconds=session_break_seconds,
-    )
+    If ``preprocessed_dir`` is set and a mapped preprocessed file exists, load that
+    JSON (from preprocess.py) instead of re-parsing raw events and re-deriving
+    keyboard/mouse time series.
+    """
+    empty_cols = ["window_start", "window_end", *FEATURE_COLUMNS, "data_group"]
+    pp_path = resolve_preprocessed_json_path(raw_user_json_path, preprocessed_dir)
+    if pp_path:
+        if logger is not None:
+            logger.info("Using preprocessed JSON: %s", pp_path)
+        frame = build_feature_df_from_preprocessed_json(
+            pp_path, window_size=window_size, stride=stride
+        )
+    else:
+        if preprocessed_dir and str(preprocessed_dir).strip() and logger is not None:
+            logger.debug(
+                "No matched preprocessed file under %s; using raw JSON if available",
+                str(preprocessed_dir).strip(),
+            )
+
+        if not os.path.isfile(raw_user_json_path):
+            return pd.DataFrame(columns=empty_cols)
+
+        try:
+            events = load_raw_kmt_user_events(raw_user_json_path, data_group="true_data")
+        except ValueError:
+            return pd.DataFrame(columns=empty_cols)
+
+        frame = build_feature_df_from_events(
+            events,
+            window_size=window_size,
+            stride=stride,
+            sequence_break_seconds=sequence_break_seconds,
+            session_break_seconds=session_break_seconds,
+        )
+
     if frame.empty:
-        return pd.DataFrame(columns=["window_start", "window_end", *FEATURE_COLUMNS, "data_group"])
+        return pd.DataFrame(columns=empty_cols)
 
     frame["data_group"] = "true_data"
     return frame
@@ -269,12 +333,37 @@ def _fit_weibull(values):
     }
 
 
+def _fit_student_t(values):
+    x = values[np.isfinite(values)]
+    n = len(x)
+    if n < 2:
+        return None
+
+    df, loc, scale = stats.t.fit(x)
+    if not np.isfinite(scale) or scale <= 0:
+        return None
+
+    ll = float(np.sum(stats.t.logpdf(x, df, loc=loc, scale=scale)))
+    if not np.isfinite(ll):
+        return None
+
+    aic, bic = _calc_aic_bic(ll, num_params=3, n_samples=n)
+    return {
+        "model": "Student-t",
+        "n_used": n,
+        "log_likelihood": ll,
+        "aic": aic,
+        "bic": bic,
+        "params": {"df": float(df), "loc": float(loc), "scale": float(scale)},
+    }
+
+
 def evaluate_feature_models(feature_name, values, user_file=None):
     """Fit four candidate distributions and return one-row-per-model results."""
     x = pd.to_numeric(values, errors="coerce").to_numpy(dtype=float)
     n_total = int(np.sum(np.isfinite(x)))
 
-    fitters = [_fit_gaussian, _fit_lognormal, _fit_gamma, _fit_weibull]
+    fitters = [_fit_gaussian, _fit_lognormal, _fit_gamma, _fit_weibull, _fit_student_t]
     rows = []
     for fitter in fitters:
         result = fitter(x)
@@ -329,6 +418,13 @@ def _theoretical_quantiles_for_model(model_name, probs, params):
             loc=params["loc"],
             scale=params["scale"],
         )
+    if model_name == "Student-t":
+        return stats.t.ppf(
+            probs,
+            params["df"],
+            loc=params["loc"],
+            scale=params["scale"],
+        )
     raise ValueError(f"Unknown model: {model_name}")
 
 
@@ -364,6 +460,7 @@ def generate_qq_plots_by_feature(all_features_df, output_dir="qqplots", logger=N
         "Log-normal": _fit_lognormal,
         "Gamma": _fit_gamma,
         "Weibull": _fit_weibull,
+        "Student-t": _fit_student_t,
     }
     metric_rows = []
 
@@ -577,18 +674,20 @@ def plot_pearson_heatmap(corr_df, title, output_path):
 
 
 def evaluate_all_users(
-    dataset_dir="./raw_kmt_dataset",
-    output_per_user_models_csv="model_fit_per_user_all_models.csv",
-    output_aggregated_summary_csv="model_fit_aggregated_summary.csv",
-    output_vote_detail_csv="model_fit_aggregated_vote_counts.csv",
-    output_weighted_detail_csv="model_fit_aggregated_weighted_by_model.csv",
-    output_pearson_mean_csv="pearson_mean_features.csv",
-    output_pearson_std_csv="pearson_std_features.csv",
-    output_pearson_mean_png="pearson_mean_features.png",
-    output_pearson_std_png="pearson_std_features.png",
-    output_feature_csv="features_all_users_merged.csv",
-    output_qq_dir="qqplots",
-    output_qq_metrics_csv="model_fit_qq_metrics.csv",
+    dataset_dir="./logs",
+    dataset_pattern="*.json",
+    preprocessed_dir="results/preprocessed_logs",
+    output_per_user_models_csv="",
+    output_aggregated_summary_csv="",
+    output_vote_detail_csv="",
+    output_weighted_detail_csv="",
+    output_pearson_mean_csv="",
+    output_pearson_std_csv="",
+    output_pearson_mean_png="",
+    output_pearson_std_png="",
+    output_feature_csv="",
+    output_qq_dir="",
+    output_qq_metrics_csv="",
     window_size=5.0,
     stride=1.0,
     sequence_break_seconds=10.0,
@@ -607,18 +706,24 @@ def evaluate_all_users(
     if logger is None:
         logger = setup_logger()
 
+    def _enabled(path):
+        return isinstance(path, str) and path.strip() != ""
+
     started_at = time.perf_counter()
-    pattern = os.path.join(dataset_dir, "raw_kmt_user_*.json")
+    pattern = os.path.join(dataset_dir, dataset_pattern)
     user_files = sorted(glob.glob(pattern))
     if not user_files:
         raise FileNotFoundError(f"No user files found with pattern: {pattern}")
     logger.info(
-        "Found %d user files from %s (true_data only, sequence_break=%.1fs, session_break=%.1fs)",
+        "Found %d input files from %s/%s (sequence_break=%.1fs, session_break=%.1fs)",
         len(user_files),
         dataset_dir,
+        dataset_pattern,
         sequence_break_seconds,
         session_break_seconds,
     )
+    if preprocessed_dir and str(preprocessed_dir).strip():
+        logger.info("Preprocessed JSON dir (used when file exists): %s", preprocessed_dir)
 
     all_frames = []
     result_rows = []
@@ -628,10 +733,12 @@ def evaluate_all_users(
         logger.info("Processing user %d/%d: %s", idx, len(user_files), user_name)
         df_user = build_feature_df_for_user(
             user_path,
+            preprocessed_dir=preprocessed_dir,
             window_size=window_size,
             stride=stride,
             sequence_break_seconds=sequence_break_seconds,
             session_break_seconds=session_break_seconds,
+            logger=logger,
         )
         if df_user.empty:
             logger.warning("No rows produced for %s", user_name)
@@ -648,43 +755,98 @@ def evaluate_all_users(
     if not all_frames:
         raise ValueError("No feature rows produced from dataset.")
 
+    if _enabled(output_feature_csv):
+        _ensure_parent_dir(output_feature_csv)
+    if _enabled(output_per_user_models_csv):
+        _ensure_parent_dir(output_per_user_models_csv)
+    if _enabled(output_aggregated_summary_csv):
+        _ensure_parent_dir(output_aggregated_summary_csv)
+    if _enabled(output_vote_detail_csv):
+        _ensure_parent_dir(output_vote_detail_csv)
+    if _enabled(output_weighted_detail_csv):
+        _ensure_parent_dir(output_weighted_detail_csv)
+    if _enabled(output_pearson_mean_csv):
+        _ensure_parent_dir(output_pearson_mean_csv)
+    if _enabled(output_pearson_std_csv):
+        _ensure_parent_dir(output_pearson_std_csv)
+    if _enabled(output_pearson_mean_png):
+        _ensure_parent_dir(output_pearson_mean_png)
+    if _enabled(output_pearson_std_png):
+        _ensure_parent_dir(output_pearson_std_png)
+    if _enabled(output_qq_metrics_csv):
+        _ensure_parent_dir(output_qq_metrics_csv)
+    if _enabled(output_qq_dir):
+        os.makedirs(output_qq_dir, exist_ok=True)
+
     all_features_df = pd.concat(all_frames, ignore_index=True)
-    all_features_df.to_csv(output_feature_csv, index=False)
-    logger.info(
-        "Saved merged feature rows: %s (rows=%d, users_with_rows=%d)",
-        output_feature_csv,
-        len(all_features_df),
-        num_with_rows,
-    )
+    if _enabled(output_feature_csv):
+        all_features_df.to_csv(output_feature_csv, index=False)
+        logger.info(
+            "Saved merged feature rows: %s (rows=%d, users_with_rows=%d)",
+            output_feature_csv,
+            len(all_features_df),
+            num_with_rows,
+        )
 
     if not result_rows:
         raise ValueError("No model fit results were produced.")
 
     result_df = pd.DataFrame(result_rows)
     result_df = result_df.sort_values(["user_file", "feature", "aic"], ascending=[True, True, True])
-    result_df.to_csv(output_per_user_models_csv, index=False)
-    logger.info("Saved per-user model fits: %s (%d rows)", output_per_user_models_csv, len(result_df))
+    if _enabled(output_per_user_models_csv):
+        result_df.to_csv(output_per_user_models_csv, index=False)
+        logger.info("Saved per-user model fits: %s (%d rows)", output_per_user_models_csv, len(result_df))
 
     aggregated_summary, vote_detail, weighted_detail = aggregate_per_user_model_fits(result_df)
-    aggregated_summary.to_csv(output_aggregated_summary_csv, index=False)
-    vote_detail.to_csv(output_vote_detail_csv, index=False)
-    weighted_detail.to_csv(output_weighted_detail_csv, index=False)
-    logger.info("Saved aggregated summary: %s", output_aggregated_summary_csv)
-    logger.info("Saved vote detail: %s", output_vote_detail_csv)
-    logger.info("Saved weighted means by model: %s", output_weighted_detail_csv)
-    mean_corr, std_corr = compute_pearson_by_stat_group(all_features_df)
-    mean_corr.to_csv(output_pearson_mean_csv, index=True)
-    std_corr.to_csv(output_pearson_std_csv, index=True)
-    plot_pearson_heatmap(mean_corr, "Pearson Correlation (Mean Features)", output_pearson_mean_png)
-    plot_pearson_heatmap(std_corr, "Pearson Correlation (Std Features)", output_pearson_std_png)
-    logger.info("Saved Pearson(mean-only): %s", output_pearson_mean_csv)
-    logger.info("Saved Pearson(std-only): %s", output_pearson_std_csv)
-    logger.info("Saved Pearson(mean heatmap): %s", output_pearson_mean_png)
-    logger.info("Saved Pearson(std heatmap): %s", output_pearson_std_png)
-    qq_metrics_df = generate_qq_plots_by_feature(all_features_df, output_dir=output_qq_dir, logger=logger)
-    qq_metrics_df.to_csv(output_qq_metrics_csv, index=False)
-    logger.info("Saved QQ plots to: %s", output_qq_dir)
-    logger.info("Saved QQ metrics: %s", output_qq_metrics_csv)
+    if _enabled(output_aggregated_summary_csv):
+        aggregated_summary.to_csv(output_aggregated_summary_csv, index=False)
+        logger.info("Saved aggregated summary: %s", output_aggregated_summary_csv)
+    if _enabled(output_vote_detail_csv):
+        vote_detail.to_csv(output_vote_detail_csv, index=False)
+        logger.info("Saved vote detail: %s", output_vote_detail_csv)
+    if _enabled(output_weighted_detail_csv):
+        weighted_detail.to_csv(output_weighted_detail_csv, index=False)
+        logger.info("Saved weighted means by model: %s", output_weighted_detail_csv)
+
+    mean_corr = None
+    std_corr = None
+    pearson_enabled = any(
+        [
+            _enabled(output_pearson_mean_csv),
+            _enabled(output_pearson_std_csv),
+            _enabled(output_pearson_mean_png),
+            _enabled(output_pearson_std_png),
+        ]
+    )
+    if pearson_enabled:
+        mean_corr, std_corr = compute_pearson_by_stat_group(all_features_df)
+        if _enabled(output_pearson_mean_csv):
+            mean_corr.to_csv(output_pearson_mean_csv, index=True)
+            logger.info("Saved Pearson(mean-only): %s", output_pearson_mean_csv)
+        if _enabled(output_pearson_std_csv):
+            std_corr.to_csv(output_pearson_std_csv, index=True)
+            logger.info("Saved Pearson(std-only): %s", output_pearson_std_csv)
+        if _enabled(output_pearson_mean_png):
+            plot_pearson_heatmap(mean_corr, "Pearson Correlation (Mean Features)", output_pearson_mean_png)
+            logger.info("Saved Pearson(mean heatmap): %s", output_pearson_mean_png)
+        if _enabled(output_pearson_std_png):
+            plot_pearson_heatmap(std_corr, "Pearson Correlation (Std Features)", output_pearson_std_png)
+            logger.info("Saved Pearson(std heatmap): %s", output_pearson_std_png)
+    else:
+        logger.info("Skip Pearson computation (all Pearson outputs disabled).")
+
+    qq_metrics_df = None
+    qq_enabled = _enabled(output_qq_dir) or _enabled(output_qq_metrics_csv)
+    if qq_enabled and _enabled(output_qq_dir):
+        qq_metrics_df = generate_qq_plots_by_feature(all_features_df, output_dir=output_qq_dir, logger=logger)
+        logger.info("Saved QQ plots to: %s", output_qq_dir)
+        if _enabled(output_qq_metrics_csv):
+            qq_metrics_df.to_csv(output_qq_metrics_csv, index=False)
+            logger.info("Saved QQ metrics: %s", output_qq_metrics_csv)
+    elif qq_enabled:
+        logger.info("Skip QQ computation (output_qq_dir is disabled).")
+    else:
+        logger.info("Skip QQ computation (QQ outputs disabled).")
 
     logger.info("Evaluation finished in %.2f sec", time.perf_counter() - started_at)
     return (
@@ -712,28 +874,30 @@ if __name__ == "__main__":
             mean_corr,
             std_corr,
         ) = evaluate_all_users(
-            dataset_dir="./raw_kmt_dataset",
-            output_per_user_models_csv="model_fit_per_user_all_models.csv",
-            output_aggregated_summary_csv="model_fit_aggregated_summary.csv",
-            output_vote_detail_csv="model_fit_aggregated_vote_counts.csv",
-            output_weighted_detail_csv="model_fit_aggregated_weighted_by_model.csv",
-            output_pearson_mean_csv="pearson_mean_features.csv",
-            output_pearson_std_csv="pearson_std_features.csv",
-            output_pearson_mean_png="pearson_mean_features.png",
-            output_pearson_std_png="pearson_std_features.png",
-            output_feature_csv="features_all_users_merged.csv",
-            output_qq_dir="qqplots",
-            output_qq_metrics_csv="model_fit_qq_metrics.csv",
+            dataset_dir="./logs",
+            dataset_pattern="*.json",
+            preprocessed_dir="results/preprocessed_logs",
+            output_per_user_models_csv="results/main/tables/model_fit_per_user_all_models.csv",
+            output_aggregated_summary_csv="results/main/tables/model_fit_aggregated_summary.csv",
+            output_vote_detail_csv="results/main/tables/model_fit_aggregated_vote_counts.csv",
+            output_weighted_detail_csv="results/main/tables/model_fit_aggregated_weighted_by_model.csv",
+            # output_pearson_mean_csv="results/main/tables/pearson_mean_features.csv",
+            # output_pearson_std_csv="results/main/tables/pearson_std_features.csv",
+            # output_pearson_mean_png="results/main/plots/pearson/pearson_mean_features.png",
+            # output_pearson_std_png="results/main/plots/pearson/pearson_std_features.png",
+            output_feature_csv="results/main/tables/features_all_users_merged.csv",
+            # output_qq_dir="results/main/plots/qq",
+            # output_qq_metrics_csv="results/main/tables/model_fit_qq_metrics.csv",
             window_size=5.0,
             stride=1.0,
             sequence_break_seconds=10.0,
             session_break_seconds=30.0,
             logger=logger,
         )
-        logger.info("Aggregated model choice (per-user fits combined):\n%s", agg_summary.to_string(index=False))
-        logger.info("Per-user fit rows: %d", len(per_user_fits))
-        logger.info("QQ metric rows: %d", len(qq_metrics))
-        logger.info("Pearson(mean) shape: %s", mean_corr.shape)
-        logger.info("Pearson(std) shape: %s", std_corr.shape)
+        # logger.info("Aggregated model choice (per-user fits combined):\n%s", agg_summary.to_string(index=False))
+        # logger.info("Per-user fit rows: %d", len(per_user_fits))
+        # logger.info("QQ metric rows: %d", len(qq_metrics))
+        # logger.info("Pearson(mean) shape: %s", mean_corr.shape)
+        # logger.info("Pearson(std) shape: %s", std_corr.shape)
     except Exception as exc:
         logger.exception("Evaluation failed: %s", exc)

@@ -1,3 +1,10 @@
 .venv/
 *.csv
 pycache/
+*.png
+qqplots/
+histograms*/
+logs/
+raw_kmt_dataset/
+results/
+__pycache__/

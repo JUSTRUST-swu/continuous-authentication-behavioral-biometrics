@@ -5,6 +5,15 @@ import os
 import numpy as np
 import pandas as pd
 
+FEATURE_COLUMNS = [
+    "dwell_mean",
+    "dwell_std",
+    "flight_mean",
+    "flight_std",
+    "velocity_mean",
+    "velocity_std",
+]
+
 
 def _mean_or_nan(values):
     """Return mean when values exist, otherwise NaN."""
@@ -27,6 +36,38 @@ def _clip_1_99_percentile(values):
         return arr
     lo, hi = np.percentile(arr, [1.0, 99.0])
     return np.clip(arr, lo, hi)
+
+
+def apply_clip_log_transform(df, feature_columns):
+    """
+    Apply 1~99 percentile clipping and log1p transform to each feature column.
+    - Percentile bounds are computed from finite values in each column.
+    - Values <= -1 become NaN before log1p.
+    """
+    out = df.copy()
+    for col in feature_columns:
+        if col not in out.columns:
+            continue
+        arr = pd.to_numeric(out[col], errors="coerce").to_numpy(dtype=float)
+        valid = np.isfinite(arr)
+        if not np.any(valid):
+            out[col] = np.nan
+            continue
+
+        vals = arr[valid]
+        if vals.size >= 2:
+            lo, hi = np.percentile(vals, [1.0, 99.0])
+            vals = np.clip(vals, lo, hi)
+
+        vals = vals.astype(float)
+        vals[vals <= -1] = np.nan
+        pos_mask = np.isfinite(vals)
+        vals[pos_mask] = np.log1p(vals[pos_mask])
+
+        transformed = np.full_like(arr, np.nan, dtype=float)
+        transformed[valid] = vals
+        out[col] = transformed
+    return out
 
 
 def load_events(path):
@@ -69,13 +110,111 @@ def load_events(path):
     return events
 
 
+def _parse_epoch_seconds(value):
+    """
+    Parse epoch to seconds.
+    - Legacy dataset uses epoch seconds (float-like string).
+    - New frontend logs may send epoch milliseconds (13-digit int).
+    """
+    t = float(value)
+    if t > 1.0e11:
+        # Millisecond epoch -> seconds
+        t = t / 1000.0
+    return t
+
+
+def _normalize_mouse_coordinates(x_val, y_val, monitor_width, monitor_height):
+    """
+    Normalize mouse coordinates by monitor size when valid dimensions exist.
+    Returns (x_norm, y_norm) in [~0, ~1] scale; falls back to original values.
+    """
+    if monitor_width is None or monitor_height is None:
+        return x_val, y_val
+    try:
+        w = float(monitor_width)
+        h = float(monitor_height)
+    except (TypeError, ValueError):
+        return x_val, y_val
+    if w <= 0 or h <= 0:
+        return x_val, y_val
+    return float(x_val) / w, float(y_val) / h
+
+
+def _append_events_from_key_mouse_lists(
+    events,
+    key_events,
+    mouse_events,
+    monitor_width=None,
+    monitor_height=None,
+):
+    if not isinstance(key_events, list):
+        key_events = []
+    if not isinstance(mouse_events, list):
+        mouse_events = []
+
+    for ev in key_events:
+        if not isinstance(ev, dict):
+            continue
+        try:
+            t = _parse_epoch_seconds(ev.get("Epoch"))
+        except (TypeError, ValueError):
+            continue
+
+        event_name = str(ev.get("Event", "")).strip().lower()
+        key_name = ev.get("Key")
+        key_value = str(key_name) if key_name is not None else None
+
+        if event_name == "pressed":
+            events.append({"type": "keydown", "key": key_value, "t": t})
+        elif event_name == "released":
+            events.append({"type": "keyup", "key": key_value, "t": t})
+
+    for ev in mouse_events:
+        if not isinstance(ev, dict):
+            continue
+        try:
+            t = _parse_epoch_seconds(ev.get("Epoch"))
+        except (TypeError, ValueError):
+            continue
+
+        event_name = str(ev.get("Event", "")).strip().lower()
+        coords = ev.get("Coordinates")
+        x_val, y_val = None, None
+        if isinstance(coords, (list, tuple)) and len(coords) >= 2:
+            try:
+                x_val = float(coords[0])
+                y_val = float(coords[1])
+                x_val, y_val = _normalize_mouse_coordinates(
+                    x_val, y_val, monitor_width, monitor_height
+                )
+            except (TypeError, ValueError):
+                x_val, y_val = None, None
+
+        if event_name == "movement":
+            if x_val is None or y_val is None:
+                continue
+            events.append({"type": "mousemove", "x": x_val, "y": y_val, "t": t})
+        elif event_name.endswith("press"):
+            button = event_name.replace(" press", "")
+            events.append({"type": "mousedown", "button": button, "x": x_val, "y": y_val, "t": t})
+        elif event_name.endswith("release"):
+            button = event_name.replace(" release", "")
+            events.append({"type": "mouseup", "button": button, "x": x_val, "y": y_val, "t": t})
+
+
 def load_raw_kmt_user_events(path, data_group="true_data"):
     """
-    Load `raw_kmt_user_N.json` and convert to internal event schema.
+    Load keyboard/mouse logs and convert to internal event schema.
 
-    Expected structure:
-    - root[data_group][test_n]["key_events"]
-    - root[data_group][test_n]["mouse_events"]
+    Supported input schemas:
+    1) Legacy raw_kmt:
+       - root[data_group][test_n]["key_events"]
+       - root[data_group][test_n]["mouse_events"]
+    2) New flat session log:
+       - root["key_events"]
+       - root["mouse_events"]
+       - optional root["session"]["monitor_width"], root["session"]["monitor_height"]
+         -> coordinates are normalized by monitor size.
     """
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -87,65 +226,102 @@ def load_raw_kmt_user_events(path, data_group="true_data"):
     except OSError as exc:
         raise OSError(f"Failed to read input file: {path}") from exc
 
-    group = raw.get(data_group)
-    if not isinstance(group, dict):
-        raise ValueError(f"Missing or invalid data group: {data_group}")
+    if not isinstance(raw, dict):
+        raise ValueError(f"Invalid JSON root object: {path}")
 
     events = []
-    for _, test_obj in sorted(group.items()):
-        if not isinstance(test_obj, dict):
-            continue
-
-        key_events = test_obj.get("key_events", [])
-        for ev in key_events:
-            if not isinstance(ev, dict):
+    group = raw.get(data_group)
+    if isinstance(group, dict):
+        for _, test_obj in sorted(group.items()):
+            if not isinstance(test_obj, dict):
                 continue
-            try:
-                t = float(ev.get("Epoch"))
-            except (TypeError, ValueError):
-                continue
-
-            event_name = str(ev.get("Event", "")).strip().lower()
-            key_name = ev.get("Key")
-            key_value = str(key_name) if key_name is not None else None
-
-            if event_name == "pressed":
-                events.append({"type": "keydown", "key": key_value, "t": t})
-            elif event_name == "released":
-                events.append({"type": "keyup", "key": key_value, "t": t})
-
-        mouse_events = test_obj.get("mouse_events", [])
-        for ev in mouse_events:
-            if not isinstance(ev, dict):
-                continue
-            try:
-                t = float(ev.get("Epoch"))
-            except (TypeError, ValueError):
-                continue
-
-            event_name = str(ev.get("Event", "")).strip().lower()
-            coords = ev.get("Coordinates")
-            x_val, y_val = None, None
-            if isinstance(coords, (list, tuple)) and len(coords) >= 2:
-                try:
-                    x_val = float(coords[0])
-                    y_val = float(coords[1])
-                except (TypeError, ValueError):
-                    x_val, y_val = None, None
-
-            if event_name == "movement":
-                if x_val is None or y_val is None:
-                    continue
-                events.append({"type": "mousemove", "x": x_val, "y": y_val, "t": t})
-            elif event_name.endswith("press"):
-                button = event_name.replace(" press", "")
-                events.append({"type": "mousedown", "button": button, "x": x_val, "y": y_val, "t": t})
-            elif event_name.endswith("release"):
-                button = event_name.replace(" release", "")
-                events.append({"type": "mouseup", "button": button, "x": x_val, "y": y_val, "t": t})
+            session_obj = test_obj.get("session") if isinstance(test_obj.get("session"), dict) else {}
+            mw = session_obj.get("monitor_width")
+            mh = session_obj.get("monitor_height")
+            _append_events_from_key_mouse_lists(
+                events,
+                test_obj.get("key_events", []),
+                test_obj.get("mouse_events", []),
+                monitor_width=mw,
+                monitor_height=mh,
+            )
+    elif isinstance(raw.get("key_events"), list) or isinstance(raw.get("mouse_events"), list):
+        session_obj = raw.get("session") if isinstance(raw.get("session"), dict) else {}
+        mw = session_obj.get("monitor_width")
+        mh = session_obj.get("monitor_height")
+        _append_events_from_key_mouse_lists(
+            events,
+            raw.get("key_events", []),
+            raw.get("mouse_events", []),
+            monitor_width=mw,
+            monitor_height=mh,
+        )
+    else:
+        raise ValueError(
+            f"Unsupported log schema: expected data_group '{data_group}' or top-level key_events/mouse_events in {path}"
+        )
 
     events.sort(key=lambda e: e["t"])
     return events
+
+
+def classify_interval_gap(gap_seconds):
+    """
+    Classify event interval by policy (used for session/sequence segmentation).
+    """
+    if gap_seconds < 0:
+        return "invalid"
+    if gap_seconds <= 1.0:
+        return "normal_interval"
+    if gap_seconds < 10.0:
+        return "pause_feature"
+    if gap_seconds < 30.0:
+        return "idle_or_sequence_break"
+    return "new_session_break"
+
+
+def split_events_by_gap(events, sequence_break_seconds=10.0, session_break_seconds=30.0):
+    """
+    Split sorted events into contiguous segments by interval policy.
+    - gap >= sequence_break_seconds: sequence break
+    - gap >= session_break_seconds: new session break
+
+    Returns:
+    - segments: list of event segments
+    - gap_stats: category counts by interval policy
+    """
+    if not events:
+        return [], {
+            "normal_interval": 0,
+            "pause_feature": 0,
+            "idle_or_sequence_break": 0,
+            "new_session_break": 0,
+            "invalid": 0,
+        }
+
+    segments = []
+    gap_stats = {
+        "normal_interval": 0,
+        "pause_feature": 0,
+        "idle_or_sequence_break": 0,
+        "new_session_break": 0,
+        "invalid": 0,
+    }
+    current = [events[0]]
+    for i in range(1, len(events)):
+        prev_t = events[i - 1]["t"]
+        cur = events[i]
+        gap = cur["t"] - prev_t
+        gap_type = classify_interval_gap(gap)
+        gap_stats[gap_type] += 1
+
+        if gap >= session_break_seconds or gap >= sequence_break_seconds:
+            segments.append(current)
+            current = [cur]
+        else:
+            current.append(cur)
+    segments.append(current)
+    return segments, gap_stats
 
 
 def extract_keyboard_features(events):
@@ -364,8 +540,7 @@ def _filter_by_window(values, anchors, w_start, w_end):
 def compute_window_features(events, keyboard_data, mouse_data, window_start, window_end, window_size):
     """
     Compute all requested features for one window.
-    velocity_mean / velocity_std: per-window 1~99% clipped positive velocities (px/s), then ln,
-    then mean and sample std of those log values.
+    Clip/log transformation is applied later in DataFrame stage.
     """
     row = {
         "window_start": window_start,
@@ -384,19 +559,12 @@ def compute_window_features(events, keyboard_data, mouse_data, window_start, win
     row["flight_mean"] = _mean_or_nan(flight_w)
     row["flight_std"] = _std_or_nan(flight_w)
 
-    # Mouse features: 1~99% clip in window, then ln(velocity px/s), then mean / std
+    # Mouse features
     velocity_w = _filter_by_window(
         mouse_data["velocity_values"], mouse_data["velocity_anchor_times"], window_start, window_end
     )
-    v_pos = [v for v in velocity_w if v > 0]
-    if not v_pos:
-        row["velocity_mean"] = np.nan
-        row["velocity_std"] = np.nan
-    else:
-        v_clipped = _clip_1_99_percentile(v_pos)
-        log_vel = np.log(v_clipped).tolist()
-        row["velocity_mean"] = _mean_or_nan(log_vel)
-        row["velocity_std"] = _std_or_nan(log_vel)
+    row["velocity_mean"] = _mean_or_nan(velocity_w)
+    row["velocity_std"] = _std_or_nan(velocity_w)
 
     return row
 
@@ -425,6 +593,9 @@ def main(input_path, output_csv_path):
     ]
 
     if not events:
+        out_dir = os.path.dirname(output_csv_path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
         df_empty = pd.DataFrame(columns=feature_columns)
         df_empty.to_csv(output_csv_path, index=False)
         return df_empty
@@ -447,7 +618,11 @@ def main(input_path, output_csv_path):
             )
         )
 
+    out_dir = os.path.dirname(output_csv_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     df = pd.DataFrame(rows, columns=feature_columns)
+    df = apply_clip_log_transform(df, FEATURE_COLUMNS)
     df.to_csv(output_csv_path, index=False)
     return df
 
@@ -470,6 +645,9 @@ def main_from_raw_kmt_user(raw_json_path, output_csv_path, data_group="true_data
     ]
 
     if not events:
+        out_dir = os.path.dirname(output_csv_path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
         df_empty = pd.DataFrame(columns=feature_columns)
         df_empty.to_csv(output_csv_path, index=False)
         return df_empty
@@ -491,16 +669,21 @@ def main_from_raw_kmt_user(raw_json_path, output_csv_path, data_group="true_data
             )
         )
 
+    out_dir = os.path.dirname(output_csv_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     df = pd.DataFrame(rows, columns=feature_columns)
+    df = apply_clip_log_transform(df, FEATURE_COLUMNS)
     df.to_csv(output_csv_path, index=False)
     return df
 
 
-def plot_feature_histograms(df, output_dir="histograms", time_bin_ms=1.0):
+def plot_feature_histograms(df, output_dir="results/histograms", time_bin_ms=1.0):
     """
     Plot histogram for each column in DataFrame and save as PNG.
+    - FEATURE_COLUMNS are transformed with 1~99 percentile clipping + log1p first.
     - Time-based features are converted sec -> ms and binned by `time_bin_ms`.
-    - Non-time features are plotted in their original unit with 30 bins.
+    - Non-time features are plotted in their transformed unit with 30 bins.
     """
     try:
         import matplotlib.pyplot as plt
@@ -508,6 +691,7 @@ def plot_feature_histograms(df, output_dir="histograms", time_bin_ms=1.0):
         raise ImportError("matplotlib is required for histogram plotting.") from exc
 
     os.makedirs(output_dir, exist_ok=True)
+    plot_df = apply_clip_log_transform(df, FEATURE_COLUMNS)
 
     time_feature_cols = {
         "dwell_mean",
@@ -520,9 +704,9 @@ def plot_feature_histograms(df, output_dir="histograms", time_bin_ms=1.0):
         "click_interval_mean",
     }
 
-    numeric_columns = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    numeric_columns = [c for c in plot_df.columns if pd.api.types.is_numeric_dtype(plot_df[c])]
     for col in numeric_columns:
-        values = pd.to_numeric(df[col], errors="coerce").dropna()
+        values = pd.to_numeric(plot_df[col], errors="coerce").dropna()
         if values.empty:
             continue
 
@@ -549,8 +733,8 @@ def plot_feature_histograms(df, output_dir="histograms", time_bin_ms=1.0):
         else:
             plt.hist(values, bins=30, edgecolor="black", alpha=0.8)
             if col in ("velocity_mean", "velocity_std"):
-                plt.xlabel(f"{col} (ln px/s)")
-                plt.title(f"Histogram: {col} (log, 1-99 pct clip per window)")
+                plt.xlabel(f"{col} (log1p px/s)")
+                plt.title(f"Histogram: {col} (log1p, 1-99 pct clip)")
             else:
                 plt.xlabel(col)
                 plt.title(f"Histogram: {col}")
@@ -565,8 +749,8 @@ def plot_feature_histograms(df, output_dir="histograms", time_bin_ms=1.0):
 if __name__ == "__main__":
     # Example usage for raw_kmt_user_0001 true_data
     INPUT_PATH = "raw_kmt_dataset/raw_kmt_user_0002.json"
-    OUTPUT_PATH = "features_user_0002_true.csv"
-    HIST_DIR = "histograms_user_0002_true"
+    OUTPUT_PATH = "results/histograms_user_0002_true/features_user_0002_true.csv"
+    HIST_DIR = "results/histograms_user_0002_true"
 
     try:
         features_df = main_from_raw_kmt_user(INPUT_PATH, OUTPUT_PATH, data_group="true_data")
