@@ -1,3 +1,4 @@
+import argparse
 import glob
 import json
 import logging
@@ -17,6 +18,7 @@ from visualize import (
     extract_keyboard_features,
     extract_mouse_features,
     load_raw_kmt_user_events,
+    load_raw_kmt_user_sessions,
     split_events_by_gap,
 )
 
@@ -64,9 +66,13 @@ def build_feature_df_from_events(
     stride=1.0,
     sequence_break_seconds=10.0,
     session_break_seconds=30.0,
+    apply_transform=True,
+    session_id=None,
+    user_id=None,
 ):
     """Create window-level feature DataFrame, excluding long idle gaps via segmentation."""
-    columns = ["window_start", "window_end"] + FEATURE_COLUMNS
+    meta_cols = ["window_start", "window_end", "user_id", "session_id", "segment_id"]
+    columns = meta_cols + FEATURE_COLUMNS
     if not events:
         return pd.DataFrame(columns=columns)
 
@@ -76,24 +82,30 @@ def build_feature_df_from_events(
         sequence_break_seconds=sequence_break_seconds,
         session_break_seconds=session_break_seconds,
     )
-    for segment_events in segments:
+    base_session = str(session_id) if session_id is not None else "session_0000"
+    for seg_i, segment_events in enumerate(segments):
         keyboard_data = extract_keyboard_features(segment_events)
         mouse_data = extract_mouse_features(segment_events)
         windows = build_windows(segment_events, window_size=window_size, stride=stride)
+        segment_id = f"{base_session}_seg{seg_i:03d}"
         for window_start, window_end in windows:
-            rows.append(
-                compute_window_features(
-                    events=segment_events,
-                    keyboard_data=keyboard_data,
-                    mouse_data=mouse_data,
-                    window_start=window_start,
-                    window_end=window_end,
-                    window_size=window_size,
-                )
+            feat = compute_window_features(
+                events=segment_events,
+                keyboard_data=keyboard_data,
+                mouse_data=mouse_data,
+                window_start=window_start,
+                window_end=window_end,
+                window_size=window_size,
             )
+            feat["user_id"] = user_id
+            feat["session_id"] = base_session
+            feat["segment_id"] = segment_id
+            rows.append(feat)
 
     df = pd.DataFrame(rows, columns=columns)
-    return apply_clip_log_transform(df, FEATURE_COLUMNS)
+    if apply_transform:
+        return apply_clip_log_transform(df, FEATURE_COLUMNS)
+    return df
 
 
 def resolve_preprocessed_json_path(raw_user_json_path, preprocessed_dir):
@@ -135,24 +147,29 @@ def build_feature_df_from_preprocessed_json(
     preprocessed_json_path,
     window_size=5.0,
     stride=1.0,
+    apply_transform=True,
+    user_id=None,
 ):
     """
     Build window feature rows from preprocess.py output (segmented keyboard/mouse series).
     Windowing uses each segment's [t_first, t_last] timeline (same as raw segment bounds).
     """
-    columns = ["window_start", "window_end"] + FEATURE_COLUMNS
+    meta_cols = ["window_start", "window_end", "user_id", "session_id", "segment_id"]
+    columns = meta_cols + FEATURE_COLUMNS
     with open(preprocessed_json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    if int(data.get("schema_version", 1)) != 1:
+    schema_ver = int(data.get("schema_version", 1))
+    if schema_ver not in (1, 2):
         raise ValueError(f"Unsupported preprocess schema_version in {preprocessed_json_path}")
 
     segments = data.get("segments")
     if not isinstance(segments, list):
         segments = []
 
+    uid = user_id if user_id is not None else data.get("user_id")
     rows = []
-    for seg in segments:
+    for seg_i, seg in enumerate(segments):
         if not isinstance(seg, dict):
             continue
         kb = seg.get("keyboard_data")
@@ -165,22 +182,44 @@ def build_feature_df_from_preprocessed_json(
         except (KeyError, TypeError, ValueError):
             continue
 
+        session_id = seg.get("session_id")
+        if session_id is None or str(session_id).strip() == "":
+            session_id = f"legacy_session_{seg_i:04d}"
+        segment_id = seg.get("segment_id")
+        if segment_id is None or str(segment_id).strip() == "":
+            segment_id = f"{session_id}_seg{seg_i:03d}"
+
         pseudo_events = [{"t": t0}, {"t": t1}]
         windows = build_windows(pseudo_events, window_size=window_size, stride=stride)
         for window_start, window_end in windows:
-            rows.append(
-                compute_window_features(
-                    events=pseudo_events,
-                    keyboard_data=kb,
-                    mouse_data=md,
-                    window_start=window_start,
-                    window_end=window_end,
-                    window_size=window_size,
-                )
+            feat = compute_window_features(
+                events=pseudo_events,
+                keyboard_data=kb,
+                mouse_data=md,
+                window_start=window_start,
+                window_end=window_end,
+                window_size=window_size,
             )
+            feat["user_id"] = uid
+            feat["session_id"] = str(session_id)
+            feat["segment_id"] = str(segment_id)
+            rows.append(feat)
 
     df = pd.DataFrame(rows, columns=columns)
-    return apply_clip_log_transform(df, FEATURE_COLUMNS)
+    if apply_transform:
+        return apply_clip_log_transform(df, FEATURE_COLUMNS)
+    return df
+
+
+def _infer_user_id_from_path(raw_user_json_path):
+    base = os.path.basename(raw_user_json_path)
+    for prefix in ("raw_kmt_user_", "preprocessed_kmt_user_"):
+        if base.startswith(prefix) and base.endswith(".json"):
+            try:
+                return int(base.replace(prefix, "").replace(".json", ""))
+            except ValueError:
+                return None
+    return None
 
 
 def build_feature_df_for_user(
@@ -191,6 +230,8 @@ def build_feature_df_for_user(
     sequence_break_seconds=10.0,
     session_break_seconds=30.0,
     logger=None,
+    apply_transform=True,
+    prefer_sessions=False,
 ):
     """
     Build feature rows for one user using true_data only.
@@ -198,14 +239,45 @@ def build_feature_df_for_user(
     If ``preprocessed_dir`` is set and a mapped preprocessed file exists, load that
     JSON (from preprocess.py) instead of re-parsing raw events and re-deriving
     keyboard/mouse time series.
+
+    ``prefer_sessions=True`` loads KMT ``test_N`` units separately (for leakage-free
+    session splits). Schema-v2 preprocessed caches with session_id are preferred.
     """
-    empty_cols = ["window_start", "window_end", *FEATURE_COLUMNS, "data_group"]
+    empty_cols = [
+        "window_start",
+        "window_end",
+        "user_id",
+        "session_id",
+        "segment_id",
+        *FEATURE_COLUMNS,
+        "data_group",
+    ]
+    user_id = _infer_user_id_from_path(raw_user_json_path)
     pp_path = resolve_preprocessed_json_path(raw_user_json_path, preprocessed_dir)
+
+    use_pp = False
     if pp_path:
+        if prefer_sessions:
+            try:
+                with open(pp_path, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                segs = meta.get("segments") or []
+                has_session = any(isinstance(s, dict) and s.get("session_id") for s in segs)
+                use_pp = bool(has_session) or int(meta.get("schema_version", 1)) >= 2
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                use_pp = False
+        else:
+            use_pp = True
+
+    if use_pp and pp_path:
         if logger is not None:
             logger.info("Using preprocessed JSON: %s", pp_path)
         frame = build_feature_df_from_preprocessed_json(
-            pp_path, window_size=window_size, stride=stride
+            pp_path,
+            window_size=window_size,
+            stride=stride,
+            apply_transform=apply_transform,
+            user_id=user_id,
         )
     else:
         if preprocessed_dir and str(preprocessed_dir).strip() and logger is not None:
@@ -217,22 +289,53 @@ def build_feature_df_for_user(
         if not os.path.isfile(raw_user_json_path):
             return pd.DataFrame(columns=empty_cols)
 
-        try:
-            events = load_raw_kmt_user_events(raw_user_json_path, data_group="true_data")
-        except ValueError:
-            return pd.DataFrame(columns=empty_cols)
+        if prefer_sessions:
+            try:
+                sessions = load_raw_kmt_user_sessions(
+                    raw_user_json_path, data_group="true_data"
+                )
+            except ValueError:
+                return pd.DataFrame(columns=empty_cols)
+            frames = []
+            for session_id, events in sessions:
+                part = build_feature_df_from_events(
+                    events,
+                    window_size=window_size,
+                    stride=stride,
+                    sequence_break_seconds=sequence_break_seconds,
+                    session_break_seconds=session_break_seconds,
+                    apply_transform=False,
+                    session_id=session_id,
+                    user_id=user_id,
+                )
+                if not part.empty:
+                    frames.append(part)
+            if not frames:
+                return pd.DataFrame(columns=empty_cols)
+            frame = pd.concat(frames, ignore_index=True)
+            if apply_transform:
+                frame = apply_clip_log_transform(frame, FEATURE_COLUMNS)
+        else:
+            try:
+                events = load_raw_kmt_user_events(raw_user_json_path, data_group="true_data")
+            except ValueError:
+                return pd.DataFrame(columns=empty_cols)
 
-        frame = build_feature_df_from_events(
-            events,
-            window_size=window_size,
-            stride=stride,
-            sequence_break_seconds=sequence_break_seconds,
-            session_break_seconds=session_break_seconds,
-        )
+            frame = build_feature_df_from_events(
+                events,
+                window_size=window_size,
+                stride=stride,
+                sequence_break_seconds=sequence_break_seconds,
+                session_break_seconds=session_break_seconds,
+                apply_transform=apply_transform,
+                user_id=user_id,
+            )
 
     if frame.empty:
         return pd.DataFrame(columns=empty_cols)
 
+    if "user_id" not in frame.columns or frame["user_id"].isna().all():
+        frame["user_id"] = user_id
     frame["data_group"] = "true_data"
     return frame
 
@@ -333,6 +436,31 @@ def _fit_weibull(values):
     }
 
 
+def _fit_loglogistic(values):
+    """Log-logistic (Fisk) MLE with floc=0; requires x > 0."""
+    x = values[np.isfinite(values)]
+    x = x[x > 0]
+    n = len(x)
+    if n < 2:
+        return None
+
+    c, loc, scale = stats.fisk.fit(x, floc=0)
+    if not np.isfinite(c) or not np.isfinite(scale) or c <= 0 or scale <= 0:
+        return None
+    ll = float(np.sum(stats.fisk.logpdf(x, c, loc=loc, scale=scale)))
+    if not np.isfinite(ll):
+        return None
+    aic, bic = _calc_aic_bic(ll, num_params=2, n_samples=n)
+    return {
+        "model": "Log-logistic",
+        "n_used": n,
+        "log_likelihood": ll,
+        "aic": aic,
+        "bic": bic,
+        "params": {"shape": float(c), "loc": float(loc), "scale": float(scale)},
+    }
+
+
 def _fit_student_t(values):
     x = values[np.isfinite(values)]
     n = len(x)
@@ -359,11 +487,18 @@ def _fit_student_t(values):
 
 
 def evaluate_feature_models(feature_name, values, user_file=None):
-    """Fit four candidate distributions and return one-row-per-model results."""
+    """Fit candidate distributions and return one-row-per-model results."""
     x = pd.to_numeric(values, errors="coerce").to_numpy(dtype=float)
     n_total = int(np.sum(np.isfinite(x)))
 
-    fitters = [_fit_gaussian, _fit_lognormal, _fit_gamma, _fit_weibull, _fit_student_t]
+    fitters = [
+        _fit_gaussian,
+        _fit_lognormal,
+        _fit_gamma,
+        _fit_weibull,
+        _fit_loglogistic,
+        _fit_student_t,
+    ]
     rows = []
     for fitter in fitters:
         result = fitter(x)
@@ -388,7 +523,7 @@ def evaluate_feature_models(feature_name, values, user_file=None):
 def _prepare_values_for_model(values, model_name):
     """Apply model-specific value filtering before fitting/QQ plotting."""
     x = values[np.isfinite(values)]
-    if model_name in ("Log-normal", "Gamma", "Weibull"):
+    if model_name in ("Log-normal", "Gamma", "Weibull", "Log-logistic"):
         x = x[x > 0]
     return x
 
@@ -413,6 +548,13 @@ def _theoretical_quantiles_for_model(model_name, probs, params):
         )
     if model_name == "Weibull":
         return stats.weibull_min.ppf(
+            probs,
+            params["shape"],
+            loc=params["loc"],
+            scale=params["scale"],
+        )
+    if model_name == "Log-logistic":
+        return stats.fisk.ppf(
             probs,
             params["shape"],
             loc=params["loc"],
@@ -460,6 +602,7 @@ def generate_qq_plots_by_feature(all_features_df, output_dir="qqplots", logger=N
         "Log-normal": _fit_lognormal,
         "Gamma": _fit_gamma,
         "Weibull": _fit_weibull,
+        "Log-logistic": _fit_loglogistic,
         "Student-t": _fit_student_t,
     }
     metric_rows = []
@@ -676,6 +819,7 @@ def plot_pearson_heatmap(corr_df, title, output_path):
 def evaluate_all_users(
     dataset_dir="./logs",
     dataset_pattern="*.json",
+    user_files=None,
     preprocessed_dir="results/preprocessed_logs",
     output_per_user_models_csv="",
     output_aggregated_summary_csv="",
@@ -697,11 +841,14 @@ def evaluate_all_users(
     """
     End-to-end: collect all user features, fit models per user, aggregate scores.
 
-    For each (user, feature) the four candidate distributions are fitted. Results are
+    For each (user, feature) the candidate distributions are fitted. Results are
     saved in long form. Final model choice per feature uses:
     - majority vote on per-user argmin AIC / argmin BIC
     - minimum weighted-mean AIC/BIC (weights = n_used)
     - maximum sum of log-likelihoods across users
+
+    If `user_files` is provided, those paths are used instead of globbing
+    `dataset_dir/dataset_pattern`.
     """
     if logger is None:
         logger = setup_logger()
@@ -710,15 +857,22 @@ def evaluate_all_users(
         return isinstance(path, str) and path.strip() != ""
 
     started_at = time.perf_counter()
-    pattern = os.path.join(dataset_dir, dataset_pattern)
-    user_files = sorted(glob.glob(pattern))
-    if not user_files:
-        raise FileNotFoundError(f"No user files found with pattern: {pattern}")
+    explicit_files = user_files is not None
+    if explicit_files:
+        user_files = [p for p in user_files if p]
+        if not user_files:
+            raise FileNotFoundError("user_files was provided but empty.")
+        source_label = "(explicit user_files)"
+    else:
+        pattern = os.path.join(dataset_dir, dataset_pattern)
+        user_files = sorted(glob.glob(pattern))
+        if not user_files:
+            raise FileNotFoundError(f"No user files found with pattern: {pattern}")
+        source_label = f"{dataset_dir}/{dataset_pattern}"
     logger.info(
-        "Found %d input files from %s/%s (sequence_break=%.1fs, session_break=%.1fs)",
+        "Found %d input files from %s (sequence_break=%.1fs, session_break=%.1fs)",
         len(user_files),
-        dataset_dir,
-        dataset_pattern,
+        source_label,
         sequence_break_seconds,
         session_break_seconds,
     )
@@ -861,43 +1015,202 @@ def evaluate_all_users(
     )
 
 
-if __name__ == "__main__":
-    logger = setup_logger()
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Fit candidate distributions per user/feature and aggregate model choice."
+    )
+    p.add_argument(
+        "--dataset-dir",
+        default="./logs",
+        help="Folder with input JSON files (default: ./logs). For KMT use ./raw_kmt_dataset.",
+    )
+    p.add_argument(
+        "--dataset-pattern",
+        default="*.json",
+        help="Glob under dataset-dir (default: *.json). Ignored when --user/--users/--user-range is set.",
+    )
+    p.add_argument(
+        "--user",
+        type=int,
+        default=None,
+        help="Single raw_kmt user id (uses raw_kmt_user_XXXX.json under --dataset-dir).",
+    )
+    p.add_argument(
+        "--users",
+        type=int,
+        nargs="+",
+        default=None,
+        help="One or more raw_kmt user ids.",
+    )
+    p.add_argument(
+        "--user-range",
+        type=int,
+        nargs=2,
+        metavar=("START", "END"),
+        default=None,
+        help="Inclusive raw_kmt user id range (e.g. 1 88).",
+    )
+    p.add_argument(
+        "--preprocessed-dir",
+        default="results/preprocessed_logs",
+        help="Preprocessed JSON dir (empty string disables). Default: results/preprocessed_logs.",
+    )
+    p.add_argument(
+        "--output-dir",
+        default="results/main",
+        help="Base output dir for tables/logs (default: results/main).",
+    )
+    p.add_argument("--window-size", type=float, default=5.0)
+    p.add_argument("--stride", type=float, default=1.0)
+    p.add_argument("--sequence-break-seconds", type=float, default=10.0)
+    p.add_argument("--session-break-seconds", type=float, default=30.0)
+    p.add_argument(
+        "--pearson",
+        action="store_true",
+        help="Also write Pearson correlation CSV/PNG under output-dir.",
+    )
+    p.add_argument(
+        "--qq",
+        action="store_true",
+        help="Also write QQ plots and metrics under output-dir.",
+    )
+    p.add_argument(
+        "--log-path",
+        default="",
+        help="Evaluate log path (default: <output-dir>/logs/evaluate.log).",
+    )
+    p.add_argument(
+        "--analysis-mode",
+        choices=["descriptive", "evaluation"],
+        default="descriptive",
+        help=(
+            "descriptive: full-corpus model summary (legacy). "
+            "evaluation: metadata tag only here; use loss_compare --mode authentication_eval for paper eval."
+        ),
+    )
+    p.add_argument(
+        "--fit-split",
+        choices=["all", "train"],
+        default="all",
+        help="Recorded in outputs; train-only fitting for auth is done in authentication_eval.",
+    )
+    return p.parse_args()
+
+
+def _resolve_cli_dataset(args):
+    """Resolve dataset_dir / pattern / optional explicit user_files list."""
+    preprocessed_dir = args.preprocessed_dir
+    dataset_dir = args.dataset_dir
+
+    if args.user_range is not None:
+        lo, hi = int(args.user_range[0]), int(args.user_range[1])
+        user_ids = list(range(lo, hi + 1))
+    elif args.users is not None:
+        user_ids = [int(u) for u in args.users]
+    elif args.user is not None:
+        user_ids = [int(args.user)]
+    else:
+        return {
+            "dataset_dir": dataset_dir,
+            "dataset_pattern": args.dataset_pattern,
+            "preprocessed_dir": preprocessed_dir,
+            "user_files": None,
+        }
+
+    if dataset_dir == "./logs":
+        dataset_dir = "./raw_kmt_dataset"
+    if preprocessed_dir == "results/preprocessed_logs":
+        preprocessed_dir = "results/preprocessed_kmt"
+
+    user_files = [
+        os.path.join(dataset_dir, f"raw_kmt_user_{uid:04d}.json") for uid in user_ids
+    ]
+    missing = [p for p in user_files if not os.path.isfile(p)]
+    if missing:
+        raise FileNotFoundError(f"Missing user file(s): {missing}")
+    return {
+        "dataset_dir": dataset_dir,
+        "dataset_pattern": "raw_kmt_user_*.json",
+        "preprocessed_dir": preprocessed_dir,
+        "user_files": user_files,
+    }
+
+
+def cli_main():
+    args = parse_args()
+    output_dir = args.output_dir
+    tables_dir = os.path.join(output_dir, "tables")
+    plots_dir = os.path.join(output_dir, "plots")
+    log_path = args.log_path.strip() or os.path.join(output_dir, "logs", "evaluate.log")
+    logger = setup_logger(log_path=log_path)
+    logger.info(
+        "analysis_mode=%s fit_split=%s (paper auth eval: loss_compare --mode authentication_eval)",
+        args.analysis_mode,
+        args.fit_split,
+    )
+
     try:
+        resolved = _resolve_cli_dataset(args)
+        pearson_mean_csv = ""
+        pearson_std_csv = ""
+        pearson_mean_png = ""
+        pearson_std_png = ""
+        qq_dir = ""
+        qq_metrics_csv = ""
+        if args.pearson:
+            pearson_mean_csv = os.path.join(tables_dir, "pearson_mean_features.csv")
+            pearson_std_csv = os.path.join(tables_dir, "pearson_std_features.csv")
+            pearson_mean_png = os.path.join(plots_dir, "pearson", "pearson_mean_features.png")
+            pearson_std_png = os.path.join(plots_dir, "pearson", "pearson_std_features.png")
+        if args.qq:
+            qq_dir = os.path.join(plots_dir, "qq")
+            qq_metrics_csv = os.path.join(tables_dir, "model_fit_qq_metrics.csv")
+
         (
             _,
             per_user_fits,
             agg_summary,
-            vote_detail,
-            weighted_detail,
+            _vote_detail,
+            _weighted_detail,
             qq_metrics,
             mean_corr,
             std_corr,
         ) = evaluate_all_users(
-            dataset_dir="./logs",
-            dataset_pattern="*.json",
-            preprocessed_dir="results/preprocessed_logs",
-            output_per_user_models_csv="results/main/tables/model_fit_per_user_all_models.csv",
-            output_aggregated_summary_csv="results/main/tables/model_fit_aggregated_summary.csv",
-            output_vote_detail_csv="results/main/tables/model_fit_aggregated_vote_counts.csv",
-            output_weighted_detail_csv="results/main/tables/model_fit_aggregated_weighted_by_model.csv",
-            # output_pearson_mean_csv="results/main/tables/pearson_mean_features.csv",
-            # output_pearson_std_csv="results/main/tables/pearson_std_features.csv",
-            # output_pearson_mean_png="results/main/plots/pearson/pearson_mean_features.png",
-            # output_pearson_std_png="results/main/plots/pearson/pearson_std_features.png",
-            output_feature_csv="results/main/tables/features_all_users_merged.csv",
-            # output_qq_dir="results/main/plots/qq",
-            # output_qq_metrics_csv="results/main/tables/model_fit_qq_metrics.csv",
-            window_size=5.0,
-            stride=1.0,
-            sequence_break_seconds=10.0,
-            session_break_seconds=30.0,
+            dataset_dir=resolved["dataset_dir"],
+            dataset_pattern=resolved["dataset_pattern"],
+            user_files=resolved.get("user_files"),
+            preprocessed_dir=resolved["preprocessed_dir"],
+            output_per_user_models_csv=os.path.join(tables_dir, "model_fit_per_user_all_models.csv"),
+            output_aggregated_summary_csv=os.path.join(tables_dir, "model_fit_aggregated_summary.csv"),
+            output_vote_detail_csv=os.path.join(tables_dir, "model_fit_aggregated_vote_counts.csv"),
+            output_weighted_detail_csv=os.path.join(
+                tables_dir, "model_fit_aggregated_weighted_by_model.csv"
+            ),
+            output_pearson_mean_csv=pearson_mean_csv,
+            output_pearson_std_csv=pearson_std_csv,
+            output_pearson_mean_png=pearson_mean_png,
+            output_pearson_std_png=pearson_std_png,
+            output_feature_csv=os.path.join(tables_dir, "features_all_users_merged.csv"),
+            output_qq_dir=qq_dir,
+            output_qq_metrics_csv=qq_metrics_csv,
+            window_size=args.window_size,
+            stride=args.stride,
+            sequence_break_seconds=args.sequence_break_seconds,
+            session_break_seconds=args.session_break_seconds,
             logger=logger,
         )
-        # logger.info("Aggregated model choice (per-user fits combined):\n%s", agg_summary.to_string(index=False))
-        # logger.info("Per-user fit rows: %d", len(per_user_fits))
-        # logger.info("QQ metric rows: %d", len(qq_metrics))
-        # logger.info("Pearson(mean) shape: %s", mean_corr.shape)
-        # logger.info("Pearson(std) shape: %s", std_corr.shape)
+        logger.info("Aggregated model choice:\n%s", agg_summary.to_string(index=False))
+        logger.info("Per-user fit rows: %d", len(per_user_fits))
+        if qq_metrics is not None:
+            logger.info("QQ metric rows: %d", len(qq_metrics))
+        if mean_corr is not None:
+            logger.info("Pearson(mean) shape: %s", mean_corr.shape)
+        if std_corr is not None:
+            logger.info("Pearson(std) shape: %s", std_corr.shape)
     except Exception as exc:
         logger.exception("Evaluation failed: %s", exc)
+        raise SystemExit(1) from exc
+
+
+if __name__ == "__main__":
+    cli_main()

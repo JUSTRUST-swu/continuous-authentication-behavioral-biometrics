@@ -1,6 +1,8 @@
+import argparse
 import json
 import math
 import os
+import re
 
 import numpy as np
 import pandas as pd
@@ -263,6 +265,84 @@ def load_raw_kmt_user_events(path, data_group="true_data"):
 
     events.sort(key=lambda e: e["t"])
     return events
+
+
+def _natural_test_key(name):
+    """Sort test_1, test_2, ..., test_10 numerically when possible."""
+    text = str(name)
+    if "_" in text:
+        suffix = text.rsplit("_", 1)[-1]
+        if suffix.isdigit():
+            return (0, int(suffix), text)
+    return (1, text, text)
+
+
+def load_raw_kmt_user_sessions(path, data_group="true_data"):
+    """
+    Load per-trial sessions from KMT or a single flat session log.
+
+    Yields ``(session_id, events)`` where:
+    - KMT ``test_N`` keys become session ids (preferred split unit; see DEVELOPMENT.md)
+    - Flat logs yield a single session ``session_0000``
+
+    Events within each session are sorted by time. Sessions are independent
+    (not concatenated), so gap-based splits inside a short trial stay local.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"Input file not found: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON format: {path}") from exc
+    except OSError as exc:
+        raise OSError(f"Failed to read input file: {path}") from exc
+
+    if not isinstance(raw, dict):
+        raise ValueError(f"Invalid JSON root object: {path}")
+
+    group = raw.get(data_group)
+    sessions = []
+    if isinstance(group, dict):
+        for test_name in sorted(group.keys(), key=_natural_test_key):
+            test_obj = group[test_name]
+            if not isinstance(test_obj, dict):
+                continue
+            events = []
+            session_obj = test_obj.get("session") if isinstance(test_obj.get("session"), dict) else {}
+            mw = session_obj.get("monitor_width")
+            mh = session_obj.get("monitor_height")
+            _append_events_from_key_mouse_lists(
+                events,
+                test_obj.get("key_events", []),
+                test_obj.get("mouse_events", []),
+                monitor_width=mw,
+                monitor_height=mh,
+            )
+            events.sort(key=lambda e: e["t"])
+            if events:
+                sessions.append((str(test_name), events))
+    elif isinstance(raw.get("key_events"), list) or isinstance(raw.get("mouse_events"), list):
+        events = []
+        session_obj = raw.get("session") if isinstance(raw.get("session"), dict) else {}
+        mw = session_obj.get("monitor_width")
+        mh = session_obj.get("monitor_height")
+        _append_events_from_key_mouse_lists(
+            events,
+            raw.get("key_events", []),
+            raw.get("mouse_events", []),
+            monitor_width=mw,
+            monitor_height=mh,
+        )
+        events.sort(key=lambda e: e["t"])
+        if events:
+            sid = raw.get("sessionId") or raw.get("session_id") or "session_0000"
+            sessions.append((str(sid), events))
+    else:
+        raise ValueError(
+            f"Unsupported log schema: expected data_group '{data_group}' or top-level key_events/mouse_events in {path}"
+        )
+    return sessions
 
 
 def classify_interval_gap(gap_seconds):
@@ -746,17 +826,121 @@ def plot_feature_histograms(df, output_dir="results/histograms", time_bin_ms=1.0
         plt.close()
 
 
-if __name__ == "__main__":
-    # Example usage for raw_kmt_user_0001 true_data
-    INPUT_PATH = "raw_kmt_dataset/raw_kmt_user_0002.json"
-    OUTPUT_PATH = "results/histograms_user_0002_true/features_user_0002_true.csv"
-    HIST_DIR = "results/histograms_user_0002_true"
+def _stem_label(input_path, user_id=None, data_group="true_data"):
+    group_tag = {
+        "true_data": "true",
+        "false_data": "false",
+    }.get(data_group, data_group)
+    if user_id is not None:
+        return f"user_{int(user_id):04d}_{group_tag}"
+    base = os.path.splitext(os.path.basename(input_path))[0]
+    m = re.match(r"raw_kmt_user_(\d+)$", base)
+    if m:
+        return f"user_{int(m.group(1)):04d}_{group_tag}"
+    return base
 
+
+def _is_raw_kmt_path(path):
+    return bool(re.search(r"raw_kmt_user_\d+\.json$", os.path.basename(path), re.I))
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Build window features and optional histograms from a session or raw_kmt JSON."
+    )
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument(
+        "--user",
+        type=int,
+        help="raw_kmt user id (uses --dataset-dir/raw_kmt_user_XXXX.json).",
+    )
+    src.add_argument(
+        "--input",
+        type=str,
+        help="Path to a session JSON or raw_kmt_user_*.json file.",
+    )
+    p.add_argument(
+        "--dataset-dir",
+        default="./raw_kmt_dataset",
+        help="Directory for --user (default: ./raw_kmt_dataset).",
+    )
+    p.add_argument(
+        "--format",
+        choices=["auto", "raw_kmt", "flat"],
+        default="auto",
+        help="Input format. auto: raw_kmt if --user or filename matches raw_kmt_user_*.json.",
+    )
+    p.add_argument(
+        "--data-group",
+        default="true_data",
+        help="raw_kmt data group key (default: true_data).",
+    )
+    p.add_argument(
+        "--output-csv",
+        default="",
+        help="Feature CSV path. Default: results/histograms_<label>/features_<label>.csv",
+    )
+    p.add_argument(
+        "--hist-dir",
+        default="",
+        help="Histogram output dir. Default: results/histograms_<label>/",
+    )
+    p.add_argument(
+        "--no-hist",
+        action="store_true",
+        help="Skip writing histogram PNGs.",
+    )
+    p.add_argument(
+        "--time-bin-ms",
+        type=float,
+        default=1.0,
+        help="Histogram bin width for time features in ms (default: 1.0).",
+    )
+    return p.parse_args()
+
+
+def cli_main():
+    args = parse_args()
+    if args.user is not None:
+        input_path = os.path.join(
+            args.dataset_dir, f"raw_kmt_user_{int(args.user):04d}.json"
+        )
+        fmt = "raw_kmt" if args.format == "auto" else args.format
+    else:
+        input_path = args.input
+        if args.format == "auto":
+            fmt = "raw_kmt" if _is_raw_kmt_path(input_path) else "flat"
+        else:
+            fmt = args.format
+
+    if not os.path.isfile(input_path):
+        raise FileNotFoundError(f"Input not found: {input_path}")
+
+    label = _stem_label(input_path, user_id=args.user, data_group=args.data_group)
+    output_csv = args.output_csv.strip() or os.path.join(
+        f"results/histograms_{label}", f"features_{label}.csv"
+    )
+    hist_dir = args.hist_dir.strip() or f"results/histograms_{label}"
+
+    if fmt == "raw_kmt":
+        features_df = main_from_raw_kmt_user(
+            input_path, output_csv, data_group=args.data_group
+        )
+    else:
+        features_df = main(input_path, output_csv)
+
+    print(f"Saved features to: {output_csv} (rows={len(features_df)})")
+    if not args.no_hist:
+        plot_feature_histograms(
+            features_df, output_dir=hist_dir, time_bin_ms=args.time_bin_ms
+        )
+        print(f"Saved histogram images to: {hist_dir}/")
+    print(features_df.head())
+
+
+if __name__ == "__main__":
     try:
-        features_df = main_from_raw_kmt_user(INPUT_PATH, OUTPUT_PATH, data_group="true_data")
-        print(f"Saved features to: {OUTPUT_PATH}")
-        plot_feature_histograms(features_df, output_dir=HIST_DIR, time_bin_ms=1.0)
-        print(f"Saved histogram images to: {HIST_DIR}/")
-        print(features_df.head())
+        cli_main()
     except Exception as exc:
         print(f"Failed to build features: {exc}")
+        raise SystemExit(1) from exc

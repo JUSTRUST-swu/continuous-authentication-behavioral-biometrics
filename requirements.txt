@@ -1,0 +1,6 @@
+flask
+numpy
+pandas
+scipy
+matplotlib
+pytest
