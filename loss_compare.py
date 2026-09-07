@@ -17,10 +17,6 @@ from main import (
 )
 
 
-# Default registry without GMM (opt-in via get_model_fitters(include_gmm=True))
-MODEL_FITTERS = get_model_fitters(include_gmm=False)
-
-
 def user_json_path(user_id, dataset_dir="./raw_kmt_dataset"):
     return os.path.join(dataset_dir, f"raw_kmt_user_{int(user_id):04d}.json")
 
@@ -41,7 +37,7 @@ def discover_user_ids(dataset_dir="./raw_kmt_dataset"):
 
 def select_models_by_aic_on_user(
     train_df,
-    include_gmm=False,
+    include_gmm=True,
     gmm_n_components=2,
     gmm_random_state=0,
 ):
@@ -49,7 +45,7 @@ def select_models_by_aic_on_user(
     For each FEATURE_COLUMN, fit candidate models on the train user and
     pick the AIC-minimizing model. Returns feature -> model_name.
 
-    GMM is considered only when include_gmm=True.
+    GMM is included by default (include_gmm=True).
     """
     model_map = {}
     for feature in FEATURE_COLUMNS:
@@ -139,6 +135,29 @@ def load_selected_models(summary_csv_path, criterion_col="best_weighted_mean_aic
     return model_map
 
 
+def resolve_include_gmm_for_model_map(model_names, include_gmm=False):
+    """
+    Return (include_gmm, requested_names).
+
+    If any selected model is ``GMM`` and include_gmm is False, enable GMM and warn
+    so legacy summary/API paths do not silently drop features.
+    """
+    requested = {
+        str(m)
+        for m in model_names
+        if m is not None and str(m).strip()
+    }
+    if "GMM" in requested and not include_gmm:
+        warnings.warn(
+            "model_map selects GMM; enabling GMM fitters automatically "
+            "(pass include_gmm=True to silence this warning).",
+            UserWarning,
+            stacklevel=2,
+        )
+        include_gmm = True
+    return include_gmm, requested
+
+
 def fit_feature_models_on_user(
     train_df,
     model_map,
@@ -154,20 +173,14 @@ def fit_feature_models_on_user(
     ``include_gmm=False`` (legacy compare/API loading a GMM summary must not silently
     drop those features). Unknown model names raise ``ValueError``.
     """
-    requested = {
-        str(model_map[f])
-        for f in FEATURE_COLUMNS
-        if f in model_map and model_map[f] is not None and str(model_map[f]).strip()
-    }
-    needs_gmm = "GMM" in requested
-    if needs_gmm and not include_gmm:
-        warnings.warn(
-            "model_map selects GMM; enabling GMM fitters automatically "
-            "(pass include_gmm=True to silence this warning).",
-            UserWarning,
-            stacklevel=2,
-        )
-        include_gmm = True
+    include_gmm, requested = resolve_include_gmm_for_model_map(
+        (
+            model_map[f]
+            for f in FEATURE_COLUMNS
+            if f in model_map
+        ),
+        include_gmm=include_gmm,
+    )
 
     fitters = get_model_fitters(
         include_gmm=include_gmm,
@@ -697,16 +710,16 @@ def parse_args():
     parser.add_argument(
         "--mode",
         type=str,
-        default="validate_risk",
+        default="authentication_eval",
         choices=[
+            "authentication_eval",
             "validate_risk",
             "user_compare",
             "train_vs_rest",
             "all_vs_rest",
-            "authentication_eval",
         ],
         help=(
-            "authentication_eval: leakage-free paper evaluation; "
+            "authentication_eval (default): leakage-free paper evaluation; "
             "validate_risk / user_compare / train_vs_rest / all_vs_rest: legacy/exploratory."
         ),
     )
@@ -805,8 +818,8 @@ def parse_args():
         "--feature-set",
         type=str,
         default="all",
-        choices=["all", "dwell", "flight", "velocity", "mouse", "keyboard"],
-        help="(authentication_eval) feature ablation group. mouse=velocity; keyboard=dwell+flight.",
+        choices=["all", "dwell", "flight", "velocity"],
+        help="(authentication_eval) feature group (default: all six features).",
     )
     parser.add_argument(
         "--distribution-selection",
@@ -814,6 +827,14 @@ def parse_args():
         default="local_aic",
         choices=["local_aic", "global_weighted_aic"],
         help="(authentication_eval) distribution family selection policy.",
+    )
+    parser.add_argument(
+        "--weight-global-aic",
+        action="store_true",
+        help=(
+            "(authentication_eval) for global_weighted_aic: weight cohort mean "
+            "AIC by n_used (default: equal weight per user)."
+        ),
     )
     parser.add_argument(
         "--window-size",
@@ -829,14 +850,18 @@ def parse_args():
     )
     parser.add_argument(
         "--include-gmm",
-        action="store_true",
-        help="(authentication_eval) opt-in: include univariate GMM in AIC candidates.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "(authentication_eval) include univariate GMM in AIC candidates "
+            "(default: True). Use --no-include-gmm to disable."
+        ),
     )
     parser.add_argument(
         "--gmm-n-components",
         type=int,
         default=2,
-        help="(authentication_eval) GMM components when --include-gmm is set (default: 2).",
+        help="(authentication_eval) GMM components when GMM is enabled (default: 2).",
     )
     parser.add_argument(
         "--logs-dir",
@@ -928,6 +953,7 @@ def main():
             stride=args.stride,
             include_gmm=bool(args.include_gmm),
             gmm_n_components=int(args.gmm_n_components),
+            weight_global_aic=bool(args.weight_global_aic),
         )
         print("authentication_eval summary:")
         print(result["summary"].to_string(index=False))

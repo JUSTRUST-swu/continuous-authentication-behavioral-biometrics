@@ -5,18 +5,19 @@ Same split seed / ratios / feature_set for both runs so only the model-family
 selection policy differs.
 
   local_aic:            per enrolled user, pick AIC-minimizing family on train
-  global_weighted_aic:  n_used-weighted mean AIC over all users' train partitions
+  global_weighted_aic:  mean AIC over all users' train partitions
                         (after each user's train-only clip+log1p), then fit params
                         on the enrolled user's transformed train.
+                        Default: equal weight per user.
+                        ``--weight-global-aic``: weight by n_used.
                         Shares the distribution *family* across the evaluation
                         cohort (population info on train only; not test leakage).
                         Enrollee-specific parameters are still fit locally.
 
-Writes:
-  results/evaluation_aic_selection/{local_aic,global_weighted_aic}/
-  results/evaluation_aic_selection/comparison_summary.csv
-  results/evaluation_aic_selection/comparison_summary_long.csv
-  results/evaluation_aic_selection/model_selection_agreement.csv
+Writes (default ``--output-root`` when omitted):
+  GMM on + unweighted (defaults): results/evaluation_aic_selection_gmm_not_weighted/
+  GMM on + --weight-global-aic:   results/evaluation_aic_selection_gmm/
+  --no-include-gmm:               results/evaluation_aic_selection/
 """
 
 from __future__ import annotations
@@ -24,6 +25,9 @@ from __future__ import annotations
 import argparse
 import os
 from typing import List, Optional
+
+# Before sklearn/numpy BLAS init (via authentication_eval → GMM/KMeans).
+os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 import pandas as pd
 
@@ -35,10 +39,23 @@ SELECTIONS = (
     ("global_weighted_aic", "global_weighted_aic"),
 )
 
-SELECTION_LABELS = {
-    "local_aic": "Local AIC",
-    "global_weighted_aic": "Global weighted AIC",
-}
+
+def _selection_labels(weight_global_aic: bool) -> dict:
+    global_label = (
+        "Global weighted AIC" if weight_global_aic else "Global mean AIC"
+    )
+    return {
+        "local_aic": "Local AIC",
+        "global_weighted_aic": global_label,
+    }
+
+
+def _default_output_root(include_gmm: bool, weight_global_aic: bool) -> str:
+    if include_gmm and not weight_global_aic:
+        return "results/evaluation_aic_selection_gmm_not_weighted"
+    if include_gmm and weight_global_aic:
+        return "results/evaluation_aic_selection_gmm"
+    return "results/evaluation_aic_selection"
 
 
 def parse_args():
@@ -47,8 +64,14 @@ def parse_args():
     )
     p.add_argument(
         "--output-root",
-        default="results/evaluation_aic_selection",
-        help="Root folder; each selection policy gets a subfolder.",
+        default=None,
+        help=(
+            "Root folder; each selection policy gets a subfolder. "
+            "Default: results/evaluation_aic_selection_gmm_not_weighted "
+            "when GMM is on without --weight-global-aic; "
+            "results/evaluation_aic_selection_gmm when weighted; "
+            "else results/evaluation_aic_selection (--no-include-gmm)."
+        ),
     )
     p.add_argument("--dataset-dir", default="./raw_kmt_dataset")
     p.add_argument("--preprocessed-dir", default="results/preprocessed_kmt")
@@ -61,21 +84,30 @@ def parse_args():
     p.add_argument(
         "--feature-set",
         default="all",
-        choices=["all", "dwell", "flight", "velocity", "mouse", "keyboard"],
+        choices=["all", "dwell", "flight", "velocity"],
         help="Feature group for both runs (default: all).",
     )
     p.add_argument("--window-size", type=float, default=5.0)
     p.add_argument("--stride", type=float, default=1.0)
     p.add_argument(
         "--include-gmm",
-        action="store_true",
-        help="Opt-in: include univariate GMM in AIC candidates.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include univariate GMM in AIC candidates (default: True). Use --no-include-gmm to disable.",
     )
     p.add_argument(
         "--gmm-n-components",
         type=int,
         default=2,
-        help="GMM components when --include-gmm is set (default: 2).",
+        help="GMM components when GMM is enabled (default: 2).",
+    )
+    p.add_argument(
+        "--weight-global-aic",
+        action="store_true",
+        help=(
+            "For global_weighted_aic: weight cohort mean AIC by n_used "
+            "(default: equal weight per user)."
+        ),
     )
     p.add_argument("--user-range", type=int, nargs=2, metavar=("START", "END"), default=None)
     p.add_argument("--users", type=int, nargs="+", default=None)
@@ -187,17 +219,24 @@ def _assert_splits_identical(path_a: str, path_b: str) -> None:
 def main():
     args = parse_args()
     user_ids = _resolve_user_ids(args)
-    os.makedirs(args.output_root, exist_ok=True)
+    weight_global_aic = bool(args.weight_global_aic)
+    include_gmm = bool(args.include_gmm)
+    output_root = args.output_root or _default_output_root(
+        include_gmm=include_gmm, weight_global_aic=weight_global_aic
+    )
+    os.makedirs(output_root, exist_ok=True)
+    selection_labels = _selection_labels(weight_global_aic)
 
     compare_rows = []
     out_dirs = {}
 
     for folder_name, selection in SELECTIONS:
-        out_dir = os.path.join(args.output_root, folder_name)
+        out_dir = os.path.join(output_root, folder_name)
         out_dirs[folder_name] = out_dir
         print(
             f"\n=== distribution_selection={selection} "
-            f"feature_set={args.feature_set} → {out_dir} ==="
+            f"feature_set={args.feature_set} "
+            f"weight_global_aic={weight_global_aic} → {out_dir} ==="
         )
         result = run_authentication_eval(
             dataset_dir=args.dataset_dir,
@@ -214,8 +253,9 @@ def main():
             distribution_selection=selection,
             window_size=args.window_size,
             stride=args.stride,
-            include_gmm=bool(args.include_gmm),
+            include_gmm=include_gmm,
             gmm_n_components=int(args.gmm_n_components),
+            weight_global_aic=weight_global_aic,
         )
         summary = result["summary"]
         print(summary.to_string(index=False))
@@ -223,8 +263,9 @@ def main():
             compare_rows.append(
                 {
                     "distribution_selection": folder_name,
-                    "label": SELECTION_LABELS.get(folder_name, folder_name),
+                    "label": selection_labels.get(folder_name, folder_name),
                     "feature_set": args.feature_set,
+                    "weight_global_aic": weight_global_aic,
                     "metric": row["metric"],
                     "macro": row["macro"],
                     "pooled": row["pooled"],
@@ -240,20 +281,21 @@ def main():
     wide_df.insert(
         1,
         "label",
-        wide_df["distribution_selection"].map(SELECTION_LABELS),
+        wide_df["distribution_selection"].map(selection_labels),
     )
+    wide_df.insert(2, "weight_global_aic", weight_global_aic)
 
-    long_path = os.path.join(args.output_root, "comparison_summary_long.csv")
-    wide_path = os.path.join(args.output_root, "comparison_summary.csv")
+    long_path = os.path.join(output_root, "comparison_summary_long.csv")
+    wide_path = os.path.join(output_root, "comparison_summary.csv")
     compare_df.to_csv(long_path, index=False)
     wide_df.to_csv(wide_path, index=False)
 
     agree_df = compare_model_selections(
         out_dirs["local_aic"], out_dirs["global_weighted_aic"]
     )
-    agree_path = os.path.join(args.output_root, "model_selection_agreement.csv")
+    agree_path = os.path.join(output_root, "model_selection_agreement.csv")
     agree_summary_path = os.path.join(
-        args.output_root, "model_selection_agreement_summary.csv"
+        output_root, "model_selection_agreement_summary.csv"
     )
     agree_df.to_csv(agree_path, index=False)
     agree_summary = summarize_model_agreement(agree_df)
@@ -269,16 +311,22 @@ def main():
     print(wide_df.to_string(index=False))
     print("\n=== model-family agreement (local vs global) ===")
     print(agree_summary.to_string(index=False))
+    weight_note = (
+        "n_used-weighted mean AIC"
+        if weight_global_aic
+        else "unweighted mean AIC over users"
+    )
     print(
-        "\nNote: global_weighted_aic shares distribution *family* across users "
-        "(train partitions only; no test leakage). Parameters remain per-enrollee."
+        f"\nNote: global_weighted_aic uses {weight_note}; shares distribution "
+        "*family* across users (train partitions only; no test leakage). "
+        "Parameters remain per-enrollee."
     )
     print(f"\nSaved: {wide_path}")
     print(f"Saved: {long_path}")
     print(f"Saved: {agree_path}")
     print(f"Saved: {agree_summary_path}")
     print(
-        f"Per-policy outputs under: {args.output_root}/"
+        f"Per-policy outputs under: {output_root}/"
         "{local_aic,global_weighted_aic}/"
     )
 

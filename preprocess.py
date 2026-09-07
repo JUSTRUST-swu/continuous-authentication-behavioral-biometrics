@@ -144,9 +144,9 @@ def preprocess_user_file(
 
 
 def preprocess_dataset(
-    dataset_dir="./logs",
+    dataset_dir="./raw_kmt_dataset",
     dataset_pattern="*.json",
-    output_dir="results/preprocessed_logs",
+    output_dir="results/preprocessed_kmt",
     data_group="true_data",
     sequence_break_seconds=10.0,
     session_break_seconds=30.0,
@@ -171,16 +171,20 @@ def preprocess_dataset(
 
 def parse_args():
     p = argparse.ArgumentParser(description="Write preprocessed time-series JSON per user.")
-    p.add_argument("--dataset-dir", default="./logs", help="Folder with session JSON logs")
+    p.add_argument(
+        "--dataset-dir",
+        default="./raw_kmt_dataset",
+        help="Folder with raw JSON (default: ./raw_kmt_dataset). For local logs use ./logs.",
+    )
     p.add_argument(
         "--dataset-pattern",
         default="*.json",
-        help="Glob pattern under dataset-dir (e.g. *.json, user_*.json)",
+        help="Glob pattern under dataset-dir (e.g. *.json, raw_kmt_user_*.json)",
     )
     p.add_argument(
         "--output-dir",
-        default="results/preprocessed_logs",
-        help="Output folder for preprocessed JSON files",
+        default="results/preprocessed_kmt",
+        help="Output folder for preprocessed JSON (default: results/preprocessed_kmt)",
     )
     p.add_argument(
         "--data-group",

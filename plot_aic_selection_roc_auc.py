@@ -1,4 +1,4 @@
-"""ROC / ROC-AUC figures for local_aic vs global_weighted_aic."""
+"""ROC / ROC-AUC figures for local_aic vs global AIC selection."""
 
 from __future__ import annotations
 
@@ -9,13 +9,13 @@ from typing import Dict, Tuple
 import numpy as np
 import pandas as pd
 
-from plot_modality_figures import load_pooled_scores, roc_curve_from_scores
+from plotting import load_pooled_scores, roc_curve_from_scores, ensure_matplotlib, save_figure, style_ax
 
 
 POLICY_ORDER = ("local_aic", "global_weighted_aic")
 POLICY_LABELS = {
     "local_aic": "Local AIC",
-    "global_weighted_aic": "Global weighted AIC",
+    "global_weighted_aic": "Global AIC",
 }
 POLICY_COLORS = {
     "local_aic": "#4C78A8",
@@ -55,12 +55,12 @@ def parse_args():
     )
     p.add_argument(
         "--title",
-        default="Authentication ROC-AUC by AIC selection (+GMM)",
+        default="Authentication ROC-AUC by AIC selection",
         help="Bar chart title.",
     )
     p.add_argument(
         "--roc-title",
-        default="ROC Curve by AIC selection (+GMM, pooled scores)",
+        default="ROC Curve by AIC selection (pooled scores)",
         help="ROC curve title.",
     )
     p.add_argument(
@@ -84,23 +84,35 @@ def load_policy_scores(root: str) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
         path = os.path.join(root, policy, "authentication_scores.csv")
         if not os.path.isfile(path):
             raise FileNotFoundError(
-                f"Missing {path}. Run: python run_aic_selection_ablation.py --include-gmm"
+                f"Missing {path}. Run: python run_aic_selection_ablation.py"
             )
         out[policy] = load_pooled_scores(path)
     return out
 
 
+def policy_labels_from_summary(summary_df: pd.DataFrame) -> Dict[str, str]:
+    if "distribution_selection" not in summary_df.columns or "label" not in summary_df.columns:
+        return dict(POLICY_LABELS)
+
+    labels = dict(POLICY_LABELS)
+    for _, row in summary_df.iterrows():
+        policy = str(row["distribution_selection"])
+        label = row.get("label")
+        if pd.notna(label) and str(label).strip():
+            labels[policy] = str(label)
+    return labels
+
+
 def plot_roc_curves(
     policy_scores: Dict[str, Tuple[np.ndarray, np.ndarray]],
     output_path: str,
-    title: str = "ROC Curve by AIC selection (+GMM, pooled scores)",
+    title: str = "ROC Curve by AIC selection (pooled scores)",
     n_thresholds: int = 501,
     dpi: int = 150,
+    policy_labels: Dict[str, str] = None,
 ) -> str:
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError as exc:
-        raise ImportError("matplotlib is required for ROC plotting.") from exc
+    plt = ensure_matplotlib()
+    labels = policy_labels or POLICY_LABELS
 
     fig, ax = plt.subplots(figsize=(6.5, 5.5))
     for policy in POLICY_ORDER:
@@ -108,7 +120,7 @@ def plot_roc_curves(
             continue
         g, i = policy_scores[policy]
         fpr, tpr, auc = roc_curve_from_scores(g, i, n_thresholds=n_thresholds)
-        label = f"{POLICY_LABELS.get(policy, policy)} (AUC = {auc:.3f})"
+        label = f"{labels.get(policy, policy)} (AUC = {auc:.3f})"
         ax.plot(
             fpr,
             tpr,
@@ -124,16 +136,9 @@ def plot_roc_curves(
     ax.set_title(title)
     ax.legend(frameon=False, loc="lower right")
     ax.set_aspect("equal", adjustable="box")
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
+    style_ax(ax)
     fig.tight_layout()
-
-    parent = os.path.dirname(output_path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    fig.savefig(output_path, dpi=dpi)
-    plt.close(fig)
-    return output_path
+    return save_figure(fig, output_path, dpi)
 
 
 def plot_roc_auc_bars(
@@ -143,11 +148,7 @@ def plot_roc_auc_bars(
     title: str = "Authentication ROC-AUC by AIC selection",
     dpi: int = 150,
 ) -> str:
-    try:
-        import matplotlib.pyplot as plt
-        import numpy as np
-    except ImportError as exc:
-        raise ImportError("matplotlib is required for ROC-AUC plotting.") from exc
+    plt = ensure_matplotlib()
 
     required = {"distribution_selection", "roc_auc_macro", "roc_auc_pooled"}
     missing = required - set(summary_df.columns)
@@ -215,16 +216,9 @@ def plot_roc_auc_bars(
     ax.set_xlabel("Distribution selection")
     ax.set_title(title)
     ax.axhline(0.5, color="gray", linestyle="--", linewidth=0.8, alpha=0.7)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
+    style_ax(ax)
     fig.tight_layout()
-
-    parent = os.path.dirname(output_path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    fig.savefig(output_path, dpi=dpi)
-    plt.close(fig)
-    return output_path
+    return save_figure(fig, output_path, dpi)
 
 
 def main():
@@ -233,11 +227,12 @@ def main():
     input_csv = args.input_csv or os.path.join(root, "comparison_summary.csv")
     bar_out = args.output or os.path.join(root, "roc_auc_by_selection.png")
     roc_out = args.roc_output or os.path.join(root, "roc_curves.png")
+    summary_df = pd.read_csv(input_csv)
+    policy_labels = policy_labels_from_summary(summary_df)
 
     if not args.roc_only:
-        df = pd.read_csv(input_csv)
         out = plot_roc_auc_bars(
-            df,
+            summary_df,
             bar_out,
             metric=args.metric,
             title=args.title,
@@ -253,6 +248,7 @@ def main():
             title=args.roc_title,
             n_thresholds=args.n_thresholds,
             dpi=args.dpi,
+            policy_labels=policy_labels,
         )
         print(f"Saved: {out}")
 

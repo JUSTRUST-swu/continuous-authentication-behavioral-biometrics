@@ -45,8 +45,6 @@ FEATURE_SETS = {
     "dwell": ["dwell_mean", "dwell_std"],
     "flight": ["flight_mean", "flight_std"],
     "velocity": ["velocity_mean", "velocity_std"],
-    "mouse": ["velocity_mean", "velocity_std"],  # alias of velocity
-    "keyboard": ["dwell_mean", "dwell_std", "flight_mean", "flight_std"],
 }
 
 
@@ -121,13 +119,6 @@ def score_user(
         per_feature_ll=per_ll,
         per_feature_n=per_n,
     )
-
-
-def legacy_risk_from_train_ll(eval_ll: float, train_ll: float) -> float:
-    """Compatibility absolute risk vs train LL (exploratory only)."""
-    if not np.isfinite(eval_ll) or not np.isfinite(train_ll):
-        return float("nan")
-    return float(max(0.0, train_ll - eval_ll))
 
 
 def _group_key_column(split_unit: str) -> str:
@@ -239,12 +230,16 @@ def _fit_models_for_enrollment(
     feature_columns: Sequence[str],
     distribution_selection: str,
     global_model_map: Optional[Dict[str, str]] = None,
-    include_gmm: bool = False,
+    include_gmm: bool = True,
     gmm_n_components: int = 2,
     gmm_random_state: int = 0,
 ) -> Tuple[dict, Dict[str, str], List[dict]]:
     """Return fitted_models, model_map, fitted_models_rows."""
-    from loss_compare import get_model_fitters, select_models_by_aic_on_user
+    from loss_compare import (
+        get_model_fitters,
+        resolve_include_gmm_for_model_map,
+        select_models_by_aic_on_user,
+    )
 
     mode = str(distribution_selection).strip().lower()
     if mode == "local_aic":
@@ -262,19 +257,9 @@ def _fit_models_for_enrollment(
     else:
         raise ValueError(f"Unknown distribution_selection={distribution_selection!r}")
 
-    requested = {
-        str(m)
-        for m in model_map.values()
-        if m is not None and str(m).strip()
-    }
-    if "GMM" in requested and not include_gmm:
-        warnings.warn(
-            "model_map selects GMM; enabling GMM fitters automatically "
-            "(pass include_gmm=True to silence this warning).",
-            UserWarning,
-            stacklevel=2,
-        )
-        include_gmm = True
+    include_gmm, requested = resolve_include_gmm_for_model_map(
+        model_map.values(), include_gmm=include_gmm
+    )
 
     fitters = get_model_fitters(
         include_gmm=include_gmm,
@@ -331,12 +316,16 @@ def _fit_models_for_enrollment(
 def _build_global_model_map_from_train(
     labeled_frames: Dict[int, pd.DataFrame],
     feature_columns: Sequence[str],
-    include_gmm: bool = False,
+    include_gmm: bool = True,
     gmm_n_components: int = 2,
     gmm_random_state: int = 0,
+    weight_by_n_used: bool = False,
 ) -> Dict[str, str]:
     """
-    Weighted-mean AIC over users' train partitions only (no test leakage).
+    Cohort mean AIC over users' train partitions only (no test leakage).
+
+    Default: equal weight per user with a valid fit.
+    ``weight_by_n_used=True``: weight each user's AIC by ``n_used``.
 
     For each user, fit clip+log1p on that user's train, transform train, then
     evaluate candidate distributions on the transformed scale (same scale as
@@ -376,9 +365,10 @@ def _build_global_model_map_from_train(
                 gmm_random_state=gmm_random_state,
             ):
                 key = (feature, row["model"])
-                w = float(row.get("n_used") or 0)
-                if w <= 0 or not np.isfinite(row.get("aic", np.nan)):
+                n_used = float(row.get("n_used") or 0)
+                if n_used <= 0 or not np.isfinite(row.get("aic", np.nan)):
                     continue
+                w = n_used if weight_by_n_used else 1.0
                 sum_w[key] += w
                 sum_waic[key] += w * float(row["aic"])
 
@@ -414,9 +404,10 @@ def run_authentication_eval(
     distribution_selection: str = "local_aic",
     window_size: float = 5.0,
     stride: float = 1.0,
-    include_gmm: bool = False,
+    include_gmm: bool = True,
     gmm_n_components: int = 2,
     gmm_random_state: int = 0,
+    weight_global_aic: bool = False,
 ) -> dict:
     """
     End-to-end leakage-free authentication evaluation.
@@ -488,6 +479,7 @@ def run_authentication_eval(
             include_gmm=include_gmm,
             gmm_n_components=gmm_n_components,
             gmm_random_state=gmm_random_state,
+            weight_by_n_used=bool(weight_global_aic),
         )
 
     score_rows: List[dict] = []
@@ -765,6 +757,7 @@ def run_authentication_eval(
         "include_gmm": bool(include_gmm),
         "gmm_n_components": int(gmm_n_components),
         "gmm_random_state": int(gmm_random_state),
+        "weight_global_aic": bool(weight_global_aic),
         "split_unit_counts": fallback_counts,
         "n_users_time_block_fallback": sum(
             1
@@ -780,7 +773,12 @@ def run_authentication_eval(
             "test EER is reporting-only."
             + (
                 " global_weighted_aic shares distribution family across cohort "
-                "train partitions (not test leakage); params remain per-enrollee."
+                "train partitions (not test leakage); params remain per-enrollee. "
+                + (
+                    "Cohort AIC uses n_used weights (--weight-global-aic)."
+                    if weight_global_aic
+                    else "Cohort AIC is unweighted mean over users (default)."
+                )
                 if str(distribution_selection).strip().lower() == "global_weighted_aic"
                 else ""
             )

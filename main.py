@@ -463,7 +463,7 @@ def _fit_loglogistic(values):
 
 def _fit_gmm(values, n_components=2, random_state=0):
     """
-    Univariate Gaussian mixture (sklearn). Opt-in only via include_gmm flags.
+    Univariate Gaussian mixture (sklearn). Included by default via include_gmm flags.
 
     Free parameters for AIC/BIC (1D, full cov): K means + K variances + (K-1) weights
     → 3K - 1.
@@ -565,9 +565,9 @@ def get_base_model_fitters():
     }
 
 
-def get_model_fitters(include_gmm=False, gmm_n_components=2, gmm_random_state=0):
+def get_model_fitters(include_gmm=True, gmm_n_components=2, gmm_random_state=0):
     """
-    Candidate distribution fitters. GMM is included only when include_gmm=True.
+    Candidate distribution fitters. GMM is included by default (include_gmm=True).
     """
     fitters = dict(get_base_model_fitters())
     if include_gmm:
@@ -582,7 +582,7 @@ def evaluate_feature_models(
     feature_name,
     values,
     user_file=None,
-    include_gmm=False,
+    include_gmm=True,
     gmm_n_components=2,
     gmm_random_state=0,
 ):
@@ -750,15 +750,19 @@ def generate_qq_plots_by_feature(all_features_df, output_dir="qqplots", logger=N
     return pd.DataFrame(metric_rows).sort_values(["feature", "model"])
 
 
-def aggregate_per_user_model_fits(per_user_df):
+def aggregate_per_user_model_fits(per_user_df, weight_by_n_used=False):
     """
     Combine per-user fit scores into a final model choice per feature.
 
     Methods:
     1) majority_vote_aic / majority_vote_bic: each user picks argmin AIC/BIC among
        fitted models for that feature; overall winner is the mode across users.
-    2) weighted_mean_aic / weighted_mean_bic: for each (feature, model), compute
-       weighted average of AIC/BIC with weights n_used; pick minimum.
+    2) cohort mean AIC/BIC: for each (feature, model), average AIC/BIC across users
+       then pick minimum.
+       - default (``weight_by_n_used=False``): equal weight per user
+       - ``weight_by_n_used=True``: weight by ``n_used``
+       Column names remain ``best_weighted_mean_*`` / ``weighted_mean_*`` for
+       backward compatibility with API / loaders.
     3) sum_log_likelihood: sum LL across users per (feature, model); pick maximum.
     """
     summary_rows = []
@@ -807,19 +811,36 @@ def aggregate_per_user_model_fits(per_user_df):
                 }
             )
 
-        # Weighted mean AIC/BIC per model (weight = n_used for that user's fit)
+        # Cohort mean AIC/BIC per model (equal weight, or n_used when requested)
         weighted_for_feature = []
         for model_name, g in sub.groupby("model"):
-            w = g["n_used"].to_numpy(dtype=float)
-            if len(w) == 0 or np.sum(w) <= 0:
+            aic = pd.to_numeric(g["aic"], errors="coerce").to_numpy(dtype=float)
+            bic = pd.to_numeric(g["bic"], errors="coerce").to_numpy(dtype=float)
+            n_used = pd.to_numeric(g["n_used"], errors="coerce").to_numpy(dtype=float)
+            finite_aic = np.isfinite(aic) & np.isfinite(n_used) & (n_used > 0)
+            finite_bic = np.isfinite(bic) & np.isfinite(n_used) & (n_used > 0)
+            if not np.any(finite_aic):
                 continue
+            if weight_by_n_used:
+                w_aic = n_used[finite_aic]
+                mean_aic = float(np.average(aic[finite_aic], weights=w_aic))
+                mean_bic = (
+                    float(np.average(bic[finite_bic], weights=n_used[finite_bic]))
+                    if np.any(finite_bic)
+                    else float("nan")
+                )
+            else:
+                mean_aic = float(np.mean(aic[finite_aic]))
+                mean_bic = float(np.mean(bic[finite_bic])) if np.any(finite_bic) else float("nan")
             weighted_for_feature.append(
                 {
                     "feature": feature,
                     "model": model_name,
-                    "weighted_mean_aic": float(np.average(g["aic"], weights=w)),
-                    "weighted_mean_bic": float(np.average(g["bic"], weights=w)),
-                    "total_n_used": int(g["n_used"].sum()),
+                    "weighted_mean_aic": mean_aic,
+                    "weighted_mean_bic": mean_bic,
+                    "total_n_used": int(np.nansum(n_used[finite_aic])),
+                    "n_users": int(np.sum(finite_aic)),
+                    "weight_by_n_used": bool(weight_by_n_used),
                 }
             )
         weighted_rows.extend(weighted_for_feature)
@@ -844,6 +865,7 @@ def aggregate_per_user_model_fits(per_user_df):
                 "best_weighted_mean_aic": best_weighted_aic,
                 "best_weighted_mean_bic": best_weighted_bic,
                 "best_sum_log_likelihood": best_sum_ll,
+                "weight_by_n_used": bool(weight_by_n_used),
             }
         )
 
@@ -933,9 +955,10 @@ def evaluate_all_users(
     val_ratio=0.2,
     test_ratio=0.2,
     split_seed=42,
-    include_gmm=False,
+    include_gmm=True,
     gmm_n_components=2,
     gmm_random_state=0,
+    weight_global_aic=False,
     logger=None,
 ):
     """
@@ -944,17 +967,18 @@ def evaluate_all_users(
     For each (user, feature) the candidate distributions are fitted. Results are
     saved in long form. Final model choice per feature uses:
     - majority vote on per-user argmin AIC / argmin BIC
-    - minimum weighted-mean AIC/BIC (weights = n_used)
+    - minimum cohort-mean AIC/BIC (equal weight per user by default;
+      ``weight_global_aic=True`` uses ``n_used`` weights)
     - maximum sum of log-likelihoods across users
 
     ``fit_split``:
     - ``train`` (default, paper-aligned): same session split as authentication_eval
       (seed/ratios), fit clip+log1p on train only, fit/vote on train only.
       ``best_weighted_mean_aic`` matches auth ``global_weighted_aic`` family selection
-      when the same users/seed/GMM flags are used.
+      when the same users/seed/GMM/weight flags are used.
     - ``all`` (legacy descriptive): fit on full per-user corpus with per-file transform.
 
-    GMM is included only when ``include_gmm=True``.
+    GMM is included by default (``include_gmm=True``); pass False / ``--no-include-gmm``.
 
     If `user_files` is provided, those paths are used instead of globbing
     `dataset_dir/dataset_pattern`.
@@ -990,10 +1014,11 @@ def evaluate_all_users(
         session_break_seconds,
     )
     logger.info(
-        "fit_split=%s include_gmm=%s gmm_n_components=%s",
+        "fit_split=%s include_gmm=%s gmm_n_components=%s weight_global_aic=%s",
         fit_mode,
         bool(include_gmm),
         int(gmm_n_components),
+        bool(weight_global_aic),
     )
     if fit_mode == "train":
         logger.info(
@@ -1199,6 +1224,7 @@ def evaluate_all_users(
         "include_gmm": bool(include_gmm),
         "gmm_n_components": int(gmm_n_components),
         "gmm_random_state": int(gmm_random_state),
+        "weight_global_aic": bool(weight_global_aic),
         "train_ratio": float(train_ratio),
         "val_ratio": float(val_ratio),
         "test_ratio": float(test_ratio),
@@ -1206,7 +1232,8 @@ def evaluate_all_users(
         "notes": (
             "fit_split=train uses authentication_eval session split + train-only "
             "clip/log1p; best_weighted_mean_aic aligns with global_weighted_aic "
-            "family selection under the same cohort/seed/GMM settings."
+            "family selection under the same cohort/seed/GMM/weight_global_aic "
+            "settings (default unweighted mean AIC; --weight-global-aic for n_used)."
             if fit_mode == "train"
             else "fit_split=all is legacy full-corpus descriptive fitting."
         ),
@@ -1225,7 +1252,9 @@ def evaluate_all_users(
         result_df.to_csv(output_per_user_models_csv, index=False)
         logger.info("Saved per-user model fits: %s (%d rows)", output_per_user_models_csv, len(result_df))
 
-    aggregated_summary, vote_detail, weighted_detail = aggregate_per_user_model_fits(result_df)
+    aggregated_summary, vote_detail, weighted_detail = aggregate_per_user_model_fits(
+        result_df, weight_by_n_used=bool(weight_global_aic)
+    )
     if _enabled(output_aggregated_summary_csv):
         aggregated_summary.to_csv(output_aggregated_summary_csv, index=False)
         logger.info("Saved aggregated summary: %s", output_aggregated_summary_csv)
@@ -1378,14 +1407,23 @@ def parse_args():
     p.add_argument("--test-ratio", type=float, default=0.2)
     p.add_argument(
         "--include-gmm",
-        action="store_true",
-        help="Opt-in: also fit univariate GMM (sklearn) as a candidate distribution.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include univariate GMM in AIC candidates (default: True). Use --no-include-gmm to disable.",
     )
     p.add_argument(
         "--gmm-n-components",
         type=int,
         default=2,
-        help="GMM mixture components when --include-gmm is set (default: 2).",
+        help="GMM mixture components when GMM is enabled (default: 2).",
+    )
+    p.add_argument(
+        "--weight-global-aic",
+        action="store_true",
+        help=(
+            "Weight cohort mean AIC/BIC by n_used when aggregating "
+            "best_weighted_mean_* (default: equal weight per user)."
+        ),
     )
     return p.parse_args()
 
@@ -1499,6 +1537,7 @@ def cli_main():
             split_seed=int(args.split_seed),
             include_gmm=bool(args.include_gmm),
             gmm_n_components=int(args.gmm_n_components),
+            weight_global_aic=bool(args.weight_global_aic),
             logger=logger,
         )
         logger.info("Aggregated model choice:\n%s", agg_summary.to_string(index=False))

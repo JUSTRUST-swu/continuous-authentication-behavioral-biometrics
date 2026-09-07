@@ -2,6 +2,10 @@
 
 프론트엔드에서 바로 붙이기 쉽게 정리한 Markdown 명세입니다.
 
+> **범위:** 로컬 온라인 데모용 (`api_server.py`). 논문 지표(ROC-AUC / FAR / FRR / EER)는
+> offline `loss_compare.py --mode authentication_eval` 경로를 쓴다.
+> 연구 상태: [RESEARCH_STATUS.md](RESEARCH_STATUS.md) · 방법: [DEVELOPMENT.md](DEVELOPMENT.md)
+
 ---
 
 ### Base URL

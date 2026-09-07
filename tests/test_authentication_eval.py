@@ -128,7 +128,7 @@ def test_global_model_map_uses_transformed_train(monkeypatch):
 
 
 def test_roc_curve_has_no_synthetic_endpoints():
-    from plot_modality_figures import roc_curve_from_scores
+    from plotting import roc_curve_from_scores
 
     genuine = [2.0, 2.5, 3.0]
     impostor = [0.0, 0.5, 1.0]
@@ -212,7 +212,7 @@ def test_fit_loglogistic_positive_support():
     assert "Log-logistic" in names
 
 
-def test_gmm_opt_in_only():
+def test_gmm_default_on_and_can_disable():
     pytest.importorskip("sklearn")
     from main import evaluate_feature_models, get_model_fitters, _fit_gmm
     from loss_compare import _logpdf_by_model
@@ -227,16 +227,17 @@ def test_gmm_opt_in_only():
     assert "GMM" not in base
     with_gmm = get_model_fitters(include_gmm=True, gmm_n_components=2)
     assert "GMM" in with_gmm
+    assert "GMM" in get_model_fitters()
 
     names_default = {r["model"] for r in evaluate_feature_models("dwell_mean", pd.Series(x))}
-    assert "GMM" not in names_default
-    names_gmm = {
+    assert "GMM" in names_default
+    names_no_gmm = {
         r["model"]
         for r in evaluate_feature_models(
-            "dwell_mean", pd.Series(x), include_gmm=True, gmm_n_components=2
+            "dwell_mean", pd.Series(x), include_gmm=False
         )
     }
-    assert "GMM" in names_gmm
+    assert "GMM" not in names_no_gmm
 
     fit = _fit_gmm(x, n_components=2, random_state=0)
     assert fit is not None
@@ -361,3 +362,82 @@ def test_main_fit_split_train_uses_train_partition_only(monkeypatch, tmp_path):
     cfg = json.loads(out_cfg.read_text(encoding="utf-8"))
     assert cfg["fit_split"] == "train"
     assert cfg["split_seed"] == 42
+    assert cfg.get("weight_global_aic") is False
+
+
+def test_global_aic_unweighted_vs_weighted_n_used(monkeypatch):
+    from authentication_eval import _build_global_model_map_from_train
+
+    # Two users with opposite AIC rankings and very different n_used so that
+    # equal-weight mean picks Gaussian while n_used-weight picks Log-normal.
+    call_i = {"n": 0}
+
+    def fake_evaluate(feature, values, user_file=None, **kwargs):
+        call_i["n"] += 1
+        if call_i["n"] == 1:
+            return [
+                {"model": "Gaussian", "aic": 10.0, "n_used": 100},
+                {"model": "Log-normal", "aic": 5.0, "n_used": 100},
+            ]
+        return [
+            {"model": "Gaussian", "aic": 10.0, "n_used": 1},
+            {"model": "Log-normal", "aic": 100.0, "n_used": 1},
+        ]
+
+    monkeypatch.setattr("authentication_eval.evaluate_feature_models", fake_evaluate)
+    monkeypatch.setattr(
+        "loss_compare.get_model_fitters",
+        lambda **kwargs: {"Gaussian": None, "Log-normal": None},
+    )
+
+    labeled = {
+        1: pd.DataFrame({"split": ["train"] * 3, "dwell_mean": [1.0, 2.0, 3.0]}),
+        2: pd.DataFrame({"split": ["train"] * 3, "dwell_mean": [1.5, 2.5, 3.5]}),
+    }
+
+    unweighted = _build_global_model_map_from_train(
+        labeled, ["dwell_mean"], weight_by_n_used=False
+    )
+    call_i["n"] = 0
+    weighted = _build_global_model_map_from_train(
+        labeled, ["dwell_mean"], weight_by_n_used=True
+    )
+    # Unweighted: Gauss mean=10, LN mean=52.5 → Gaussian
+    assert unweighted["dwell_mean"] == "Gaussian"
+    # Weighted: Gauss≈10, LN≈5.94 → Log-normal
+    assert weighted["dwell_mean"] == "Log-normal"
+
+
+def test_aggregate_mean_aic_respects_weight_flag():
+    from main import aggregate_per_user_model_fits
+
+    rows = []
+    for user, aic_g, aic_ln, n in [
+        ("u1", 10.0, 5.0, 100),
+        ("u2", 10.0, 100.0, 1),
+    ]:
+        for model, aic in [("Gaussian", aic_g), ("Log-normal", aic_ln)]:
+            rows.append(
+                {
+                    "user_file": user,
+                    "feature": "dwell_mean",
+                    "model": model,
+                    "aic": aic,
+                    "bic": aic + 1.0,
+                    "n_used": n,
+                    "log_likelihood": -aic,
+                }
+            )
+    df = pd.DataFrame(rows)
+
+    summary_u, _, detail_u = aggregate_per_user_model_fits(df, weight_by_n_used=False)
+    summary_w, _, detail_w = aggregate_per_user_model_fits(df, weight_by_n_used=True)
+
+    row_u = summary_u[summary_u["feature"] == "dwell_mean"].iloc[0]
+    row_w = summary_w[summary_w["feature"] == "dwell_mean"].iloc[0]
+    assert row_u["best_weighted_mean_aic"] == "Gaussian"
+    assert row_w["best_weighted_mean_aic"] == "Log-normal"
+    assert bool(row_u["weight_by_n_used"]) is False
+    assert bool(row_w["weight_by_n_used"]) is True
+    assert bool(detail_u["weight_by_n_used"].iloc[0]) is False
+    assert bool(detail_w["weight_by_n_used"].iloc[0]) is True

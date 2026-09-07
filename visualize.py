@@ -31,15 +31,6 @@ def _std_or_nan(values):
     return float(np.std(values, ddof=1))
 
 
-def _clip_1_99_percentile(values):
-    """1~99 percentile clipping on a 1d array; 2+ samples required to alter bounds."""
-    arr = np.asarray(values, dtype=float)
-    if arr.size < 2:
-        return arr
-    lo, hi = np.percentile(arr, [1.0, 99.0])
-    return np.clip(arr, lo, hi)
-
-
 def apply_clip_log_transform(df, feature_columns):
     """
     Apply 1~99 percentile clipping and log1p transform to each feature column.
