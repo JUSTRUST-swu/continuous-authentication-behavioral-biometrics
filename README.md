@@ -27,17 +27,16 @@ KMT(Mendeley) 기반 키스트로크·마우스 생체인증 RnE.
 ## 논문용 실행 (primary)
 
 ```bash
-# 인증 평가 (기본: validation EER threshold, local AIC)
+# 인증 평가 (기본: validation EER, local AIC, 6분포 — GMM 없음)
 python loss_compare.py --mode authentication_eval
 
-# modality ablation (keyboard / mouse / all)
-python run_modality_ablation.py
+# GMM을 AIC 후보에 포함하려면 플래그 필요
+python loss_compare.py --mode authentication_eval --include-gmm
+python loss_compare.py --mode authentication_eval --include-gmm --gmm-n-components 3
 
 # local AIC vs global weighted AIC
 python run_aic_selection_ablation.py
-
-# 결과 그림
-python plot_modality_figures.py
+python run_aic_selection_ablation.py --include-gmm --output-root results/evaluation_aic_selection_gmm
 
 # 단위 테스트
 pytest -q
@@ -46,19 +45,32 @@ pytest -q
 결과 기본 경로:
 
 - `results/evaluation/`
-- `results/evaluation_modality/`
 - `results/evaluation_aic_selection/`
+- `results/evaluation_aic_selection_gmm/`
 
 구 threshold(본인 val 하위 5%): `--threshold-mode genuine_quantile`
+
+---
+
+## 논문용 분포 vote (`main.py`)
+
+인증 평가와 **동일**하게 train 파티션만 사용 (기본 `--fit-split train`, seed 42, 6/2/2).
+
+```bash
+python main.py --user-range 1 88 --output-dir results/main_kmt
+python main.py --user-range 1 88 --include-gmm --output-dir results/main_kmt_gmm
+```
+
+산출: `tables/model_fit_aggregated_summary.csv` (`best_weighted_mean_aic` ≈ auth `global_weighted_aic` family),  
+`model_fit_aggregated_vote_counts.csv`, `split_assignments.csv`, `model_fit_run_config.json`.
+
+legacy 전 구간 fit: `--fit-split all`
 
 ---
 
 ## 보조 / legacy
 
 ```bash
-# 분포 fit 기술 통계
-python main.py --user-range 1 88 --output-dir results/main_kmt
-
 # 히스토그램
 python visualize.py --user 70
 
@@ -80,9 +92,7 @@ python api_server.py --host 127.0.0.1 --port 3001
 | `evaluation_split.py` | train/val/test (`test_N` 우선) |
 | `feature_transform.py` | train-only clip + log1p |
 | `auth_metrics.py` | FAR/FRR/EER/ROC-AUC |
-| `main.py` | 전 user 분포 fit·집계 |
+| `main.py` | 전 user 분포 fit·vote (기본 train-only) |
 | `visualize.py` / `preprocess.py` | feature 추출·캐시 |
-| `run_modality_ablation.py` | modality 비교 |
-| `run_aic_selection_ablation.py` | local vs global AIC |
-| `plot_modality_figures.py` | ROC / EER / FAR·FRR 그림 |
+| `run_aic_selection_ablation.py` | local vs global AIC (±GMM) |
 | `api_server.py` | 온라인 train/validate |

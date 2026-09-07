@@ -43,6 +43,17 @@ def parse_args():
     p.add_argument("--distribution-selection", default="local_aic")
     p.add_argument("--window-size", type=float, default=5.0)
     p.add_argument("--stride", type=float, default=1.0)
+    p.add_argument(
+        "--include-gmm",
+        action="store_true",
+        help="Opt-in: include univariate GMM in AIC candidates.",
+    )
+    p.add_argument(
+        "--gmm-n-components",
+        type=int,
+        default=2,
+        help="GMM components when --include-gmm is set (default: 2).",
+    )
     p.add_argument("--user-range", type=int, nargs=2, metavar=("START", "END"), default=None)
     p.add_argument("--users", type=int, nargs="+", default=None)
     return p.parse_args()
@@ -93,6 +104,8 @@ def main():
             distribution_selection=args.distribution_selection,
             window_size=args.window_size,
             stride=args.stride,
+            include_gmm=bool(args.include_gmm),
+            gmm_n_components=int(args.gmm_n_components),
         )
         summary = result["summary"]
         print(summary.to_string(index=False))

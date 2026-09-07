@@ -1,5 +1,7 @@
 """Minimal leakage-free evaluation tests."""
 
+import json
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -92,7 +94,7 @@ def test_global_model_map_uses_transformed_train(monkeypatch):
 
     seen = []
 
-    def capture_evaluate(feature, values, user_file=None):
+    def capture_evaluate(feature, values, user_file=None, **kwargs):
         arr = pd.to_numeric(pd.Series(values), errors="coerce").to_numpy(dtype=float)
         finite = arr[np.isfinite(arr)]
         seen.append(finite.copy())
@@ -208,3 +210,154 @@ def test_fit_loglogistic_positive_support():
     rows = evaluate_feature_models("dwell_mean", pd.Series(x))
     names = {r["model"] for r in rows}
     assert "Log-logistic" in names
+
+
+def test_gmm_opt_in_only():
+    pytest.importorskip("sklearn")
+    from main import evaluate_feature_models, get_model_fitters, _fit_gmm
+    from loss_compare import _logpdf_by_model
+
+    x = np.concatenate(
+        [
+            np.random.default_rng(0).normal(-1.0, 0.3, size=80),
+            np.random.default_rng(1).normal(1.5, 0.4, size=80),
+        ]
+    )
+    base = get_model_fitters(include_gmm=False)
+    assert "GMM" not in base
+    with_gmm = get_model_fitters(include_gmm=True, gmm_n_components=2)
+    assert "GMM" in with_gmm
+
+    names_default = {r["model"] for r in evaluate_feature_models("dwell_mean", pd.Series(x))}
+    assert "GMM" not in names_default
+    names_gmm = {
+        r["model"]
+        for r in evaluate_feature_models(
+            "dwell_mean", pd.Series(x), include_gmm=True, gmm_n_components=2
+        )
+    }
+    assert "GMM" in names_gmm
+
+    fit = _fit_gmm(x, n_components=2, random_state=0)
+    assert fit is not None
+    assert fit["model"] == "GMM"
+    assert len(fit["params"]["weights"]) == 2
+    ll = _logpdf_by_model("GMM", x[:5], fit["params"])
+    assert ll.shape == (5,)
+    assert np.all(np.isfinite(ll))
+
+
+def test_fit_feature_models_auto_enables_gmm_from_map():
+    """Legacy compare/API: GMM in model_map must not be silently skipped."""
+    pytest.importorskip("sklearn")
+    from main import FEATURE_COLUMNS
+    from loss_compare import fit_feature_models_on_user
+
+    rng = np.random.default_rng(0)
+    n = 120
+    data = {f: rng.normal(size=n) for f in FEATURE_COLUMNS}
+    # Positive support for log-family features if map ever selects them.
+    for f in ("dwell_mean", "flight_mean", "velocity_mean"):
+        data[f] = np.abs(data[f]) + 0.1
+    train_df = pd.DataFrame(data)
+    model_map = {f: "GMM" for f in FEATURE_COLUMNS}
+
+    with pytest.warns(UserWarning, match="enabling GMM"):
+        fitted = fit_feature_models_on_user(train_df, model_map, include_gmm=False)
+
+    assert len(fitted) == len(FEATURE_COLUMNS)
+    assert all(fitted[f]["model"] == "GMM" for f in FEATURE_COLUMNS)
+
+    with pytest.raises(ValueError, match="unknown model"):
+        fit_feature_models_on_user(
+            train_df, {"dwell_mean": "NotARealModel"}, include_gmm=False
+        )
+
+
+def test_main_fit_split_train_uses_train_partition_only(monkeypatch, tmp_path):
+    """evaluate_all_users(fit_split=train) must fit on train rows after split+transform."""
+    from main import FEATURE_COLUMNS, evaluate_all_users
+
+    sessions = [f"test_{i}" for i in range(1, 11)]
+    rows = []
+    for s_i, sid in enumerate(sessions):
+        for w in range(3):
+            row = {
+                "window_start": float(s_i * 10 + w),
+                "window_end": float(s_i * 10 + w + 5),
+                "user_id": 1,
+                "session_id": sid,
+                "segment_id": f"seg_{s_i}",
+                "data_group": "true_data",
+            }
+            for feat in FEATURE_COLUMNS:
+                row[feat] = 1.0 + 0.1 * s_i + 0.01 * w
+            rows.append(row)
+    raw_df = pd.DataFrame(rows)
+
+    def fake_build(path, **kwargs):
+        assert kwargs.get("apply_transform") is False
+        assert kwargs.get("prefer_sessions") is True
+        return raw_df.copy()
+
+    seen_lengths = []
+
+    def capture_evaluate(feature, values, user_file=None, **kwargs):
+        arr = pd.to_numeric(pd.Series(values), errors="coerce").to_numpy(dtype=float)
+        seen_lengths.append(int(np.sum(np.isfinite(arr))))
+        n = int(np.sum(np.isfinite(arr)))
+        rows = [
+            {
+                "feature": feature,
+                "model": "Gaussian",
+                "aic": 10.0,
+                "n_used": n,
+                "bic": 11.0,
+                "log_likelihood": -1.0,
+            },
+            {
+                "feature": feature,
+                "model": "Log-normal",
+                "aic": 20.0,
+                "n_used": n,
+                "bic": 21.0,
+                "log_likelihood": -2.0,
+            },
+        ]
+        if user_file is not None:
+            for r in rows:
+                r["user_file"] = user_file
+        return rows
+
+    monkeypatch.setattr("main.build_feature_df_for_user", fake_build)
+    monkeypatch.setattr("main.evaluate_feature_models", capture_evaluate)
+    monkeypatch.setattr("main._infer_user_id_from_path", lambda path: 1)
+
+    user_file = tmp_path / "raw_kmt_user_0001.json"
+    user_file.write_text("{}", encoding="utf-8")
+    out_split = tmp_path / "split_assignments.csv"
+    out_cfg = tmp_path / "run_config.json"
+
+    _, result_df, agg, *_rest = evaluate_all_users(
+        user_files=[str(user_file)],
+        preprocessed_dir="",
+        fit_split="train",
+        split_seed=42,
+        train_ratio=0.6,
+        val_ratio=0.2,
+        test_ratio=0.2,
+        output_split_assignments_csv=str(out_split),
+        output_run_config_json=str(out_cfg),
+        logger=None,
+    )
+
+    # 10 sessions × 3 windows = 30; train ≈ 6 sessions → 18 windows
+    assert seen_lengths
+    assert all(n == 18 for n in seen_lengths)
+    assert not result_df.empty
+    assert "best_weighted_mean_aic" in agg.columns
+    assert out_split.is_file()
+    assert out_cfg.is_file()
+    cfg = json.loads(out_cfg.read_text(encoding="utf-8"))
+    assert cfg["fit_split"] == "train"
+    assert cfg["split_seed"] == 42

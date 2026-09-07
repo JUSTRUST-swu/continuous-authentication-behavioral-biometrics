@@ -239,13 +239,21 @@ def _fit_models_for_enrollment(
     feature_columns: Sequence[str],
     distribution_selection: str,
     global_model_map: Optional[Dict[str, str]] = None,
+    include_gmm: bool = False,
+    gmm_n_components: int = 2,
+    gmm_random_state: int = 0,
 ) -> Tuple[dict, Dict[str, str], List[dict]]:
     """Return fitted_models, model_map, fitted_models_rows."""
-    from loss_compare import MODEL_FITTERS, select_models_by_aic_on_user
+    from loss_compare import get_model_fitters, select_models_by_aic_on_user
 
     mode = str(distribution_selection).strip().lower()
     if mode == "local_aic":
-        model_map = select_models_by_aic_on_user(train_df)
+        model_map = select_models_by_aic_on_user(
+            train_df,
+            include_gmm=include_gmm,
+            gmm_n_components=gmm_n_components,
+            gmm_random_state=gmm_random_state,
+        )
         model_map = {f: m for f, m in model_map.items() if f in feature_columns}
     elif mode == "global_weighted_aic":
         if not global_model_map:
@@ -254,21 +262,59 @@ def _fit_models_for_enrollment(
     else:
         raise ValueError(f"Unknown distribution_selection={distribution_selection!r}")
 
+    requested = {
+        str(m)
+        for m in model_map.values()
+        if m is not None and str(m).strip()
+    }
+    if "GMM" in requested and not include_gmm:
+        warnings.warn(
+            "model_map selects GMM; enabling GMM fitters automatically "
+            "(pass include_gmm=True to silence this warning).",
+            UserWarning,
+            stacklevel=2,
+        )
+        include_gmm = True
+
+    fitters = get_model_fitters(
+        include_gmm=include_gmm,
+        gmm_n_components=gmm_n_components,
+        gmm_random_state=gmm_random_state,
+    )
+    unknown = sorted(requested - set(fitters))
+    if unknown:
+        raise ValueError(
+            f"model_map references unknown model(s) {unknown}; "
+            f"known={sorted(fitters)}"
+        )
+
     fitted = {}
     rows = []
     for feature in feature_columns:
         model_name = model_map.get(feature)
-        if model_name not in MODEL_FITTERS:
+        if model_name is None or model_name not in fitters:
             continue
-        eval_rows = evaluate_feature_models(feature, train_df[feature])
+        eval_rows = evaluate_feature_models(
+            feature,
+            train_df[feature],
+            include_gmm=include_gmm,
+            gmm_n_components=gmm_n_components,
+            gmm_random_state=gmm_random_state,
+        )
         chosen = next((r for r in eval_rows if r.get("model") == model_name), None)
-        result = MODEL_FITTERS[model_name](
+        result = fitters[model_name](
             pd.to_numeric(train_df[feature], errors="coerce").to_numpy(dtype=float)
         )
         if result is None:
             continue
         fitted[feature] = {"model": model_name, **result}
         params = result.get("params") or {}
+        flat_params = {}
+        for k, v in params.items():
+            if isinstance(v, (list, tuple, dict)):
+                flat_params[f"param_{k}"] = json.dumps(v)
+            else:
+                flat_params[f"param_{k}"] = v
         rows.append(
             {
                 "feature": feature,
@@ -276,7 +322,7 @@ def _fit_models_for_enrollment(
                 "aic": None if chosen is None else chosen.get("aic"),
                 "bic": None if chosen is None else chosen.get("bic"),
                 "n_train": int(result.get("n_used", 0)),
-                **{f"param_{k}": v for k, v in params.items()},
+                **flat_params,
             }
         )
     return fitted, model_map, rows
@@ -285,6 +331,9 @@ def _fit_models_for_enrollment(
 def _build_global_model_map_from_train(
     labeled_frames: Dict[int, pd.DataFrame],
     feature_columns: Sequence[str],
+    include_gmm: bool = False,
+    gmm_n_components: int = 2,
+    gmm_random_state: int = 0,
 ) -> Dict[str, str]:
     """
     Weighted-mean AIC over users' train partitions only (no test leakage).
@@ -300,7 +349,13 @@ def _build_global_model_map_from_train(
     """
     from collections import defaultdict
 
-    from loss_compare import MODEL_FITTERS
+    from loss_compare import get_model_fitters
+
+    fitters = get_model_fitters(
+        include_gmm=include_gmm,
+        gmm_n_components=gmm_n_components,
+        gmm_random_state=gmm_random_state,
+    )
 
     sum_w = defaultdict(float)
     sum_waic = defaultdict(float)
@@ -313,7 +368,13 @@ def _build_global_model_map_from_train(
         for feature in feature_columns:
             if feature not in train_tx.columns:
                 continue
-            for row in evaluate_feature_models(feature, train_tx[feature]):
+            for row in evaluate_feature_models(
+                feature,
+                train_tx[feature],
+                include_gmm=include_gmm,
+                gmm_n_components=gmm_n_components,
+                gmm_random_state=gmm_random_state,
+            ):
                 key = (feature, row["model"])
                 w = float(row.get("n_used") or 0)
                 if w <= 0 or not np.isfinite(row.get("aic", np.nan)):
@@ -325,7 +386,7 @@ def _build_global_model_map_from_train(
     for feature in feature_columns:
         best_model = None
         best_val = float("inf")
-        for model_name in MODEL_FITTERS:
+        for model_name in fitters:
             key = (feature, model_name)
             if sum_w[key] <= 0:
                 continue
@@ -353,6 +414,9 @@ def run_authentication_eval(
     distribution_selection: str = "local_aic",
     window_size: float = 5.0,
     stride: float = 1.0,
+    include_gmm: bool = False,
+    gmm_n_components: int = 2,
+    gmm_random_state: int = 0,
 ) -> dict:
     """
     End-to-end leakage-free authentication evaluation.
@@ -418,7 +482,13 @@ def run_authentication_eval(
 
     global_model_map = None
     if distribution_selection == "global_weighted_aic":
-        global_model_map = _build_global_model_map_from_train(labeled, feature_columns)
+        global_model_map = _build_global_model_map_from_train(
+            labeled,
+            feature_columns,
+            include_gmm=include_gmm,
+            gmm_n_components=gmm_n_components,
+            gmm_random_state=gmm_random_state,
+        )
 
     score_rows: List[dict] = []
     per_feature_rows: List[dict] = []
@@ -453,6 +523,9 @@ def run_authentication_eval(
             feature_columns,
             distribution_selection=distribution_selection,
             global_model_map=global_model_map,
+            include_gmm=include_gmm,
+            gmm_n_components=gmm_n_components,
+            gmm_random_state=gmm_random_state,
         )
         if not fitted:
             warnings.warn(f"user {enrolled:04d}: no fitted models; skip")
@@ -689,6 +762,9 @@ def run_authentication_eval(
         "distribution_selection": distribution_selection,
         "window_size": window_size,
         "stride": stride,
+        "include_gmm": bool(include_gmm),
+        "gmm_n_components": int(gmm_n_components),
+        "gmm_random_state": int(gmm_random_state),
         "split_unit_counts": fallback_counts,
         "n_users_time_block_fallback": sum(
             1

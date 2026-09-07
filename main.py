@@ -461,6 +461,74 @@ def _fit_loglogistic(values):
     }
 
 
+def _fit_gmm(values, n_components=2, random_state=0):
+    """
+    Univariate Gaussian mixture (sklearn). Opt-in only via include_gmm flags.
+
+    Free parameters for AIC/BIC (1D, full cov): K means + K variances + (K-1) weights
+    → 3K - 1.
+    """
+    try:
+        from sklearn.mixture import GaussianMixture
+    except ImportError as exc:
+        raise ImportError(
+            "scikit-learn is required for GMM. Install with: pip install scikit-learn"
+        ) from exc
+
+    x = values[np.isfinite(values)]
+    n = len(x)
+    k = int(n_components)
+    if k < 1:
+        return None
+    if n < max(2, k):
+        return None
+
+    x2 = x.reshape(-1, 1)
+    try:
+        gmm = GaussianMixture(
+            n_components=k,
+            covariance_type="full",
+            random_state=int(random_state),
+            n_init=3,
+            max_iter=200,
+        )
+        gmm.fit(x2)
+    except Exception:
+        return None
+
+    ll = float(np.sum(gmm.score_samples(x2)))
+    if not np.isfinite(ll):
+        return None
+
+    weights = gmm.weights_.astype(float).ravel()
+    means = gmm.means_.astype(float).ravel()
+    # full cov in 1D → shape (K, 1, 1)
+    vars_ = np.asarray(gmm.covariances_, dtype=float).reshape(k)
+    stds = np.sqrt(np.maximum(vars_, 1e-12))
+    num_params = 3 * k - 1
+    aic, bic = _calc_aic_bic(ll, num_params=num_params, n_samples=n)
+    return {
+        "model": "GMM",
+        "n_used": n,
+        "log_likelihood": ll,
+        "aic": aic,
+        "bic": bic,
+        "params": {
+            "n_components": int(k),
+            "weights": [float(w) for w in weights],
+            "means": [float(m) for m in means],
+            "stds": [float(s) for s in stds],
+        },
+    }
+
+
+def _make_gmm_fitter(n_components=2, random_state=0):
+    def _fitter(values):
+        return _fit_gmm(values, n_components=n_components, random_state=random_state)
+
+    return _fitter
+
+
 def _fit_student_t(values):
     x = values[np.isfinite(values)]
     n = len(x)
@@ -486,19 +554,48 @@ def _fit_student_t(values):
     }
 
 
-def evaluate_feature_models(feature_name, values, user_file=None):
+def get_base_model_fitters():
+    return {
+        "Gaussian": _fit_gaussian,
+        "Log-normal": _fit_lognormal,
+        "Gamma": _fit_gamma,
+        "Weibull": _fit_weibull,
+        "Log-logistic": _fit_loglogistic,
+        "Student-t": _fit_student_t,
+    }
+
+
+def get_model_fitters(include_gmm=False, gmm_n_components=2, gmm_random_state=0):
+    """
+    Candidate distribution fitters. GMM is included only when include_gmm=True.
+    """
+    fitters = dict(get_base_model_fitters())
+    if include_gmm:
+        fitters["GMM"] = _make_gmm_fitter(
+            n_components=int(gmm_n_components),
+            random_state=int(gmm_random_state),
+        )
+    return fitters
+
+
+def evaluate_feature_models(
+    feature_name,
+    values,
+    user_file=None,
+    include_gmm=False,
+    gmm_n_components=2,
+    gmm_random_state=0,
+):
     """Fit candidate distributions and return one-row-per-model results."""
-    x = pd.to_numeric(values, errors="coerce").to_numpy(dtype=float)
+    arr = pd.to_numeric(values, errors="coerce")
+    x = np.asarray(arr, dtype=float)
     n_total = int(np.sum(np.isfinite(x)))
 
-    fitters = [
-        _fit_gaussian,
-        _fit_lognormal,
-        _fit_gamma,
-        _fit_weibull,
-        _fit_loglogistic,
-        _fit_student_t,
-    ]
+    fitters = list(get_model_fitters(
+        include_gmm=include_gmm,
+        gmm_n_components=gmm_n_components,
+        gmm_random_state=gmm_random_state,
+    ).values())
     rows = []
     for fitter in fitters:
         result = fitter(x)
@@ -597,14 +694,7 @@ def generate_qq_plots_by_feature(all_features_df, output_dir="qqplots", logger=N
 
     os.makedirs(output_dir, exist_ok=True)
 
-    model_fitters = {
-        "Gaussian": _fit_gaussian,
-        "Log-normal": _fit_lognormal,
-        "Gamma": _fit_gamma,
-        "Weibull": _fit_weibull,
-        "Log-logistic": _fit_loglogistic,
-        "Student-t": _fit_student_t,
-    }
+    model_fitters = get_base_model_fitters()
     metric_rows = []
 
     for feature in FEATURE_COLUMNS:
@@ -832,20 +922,39 @@ def evaluate_all_users(
     output_feature_csv="",
     output_qq_dir="",
     output_qq_metrics_csv="",
+    output_split_assignments_csv="",
+    output_run_config_json="",
     window_size=5.0,
     stride=1.0,
     sequence_break_seconds=10.0,
     session_break_seconds=30.0,
+    fit_split="train",
+    train_ratio=0.6,
+    val_ratio=0.2,
+    test_ratio=0.2,
+    split_seed=42,
+    include_gmm=False,
+    gmm_n_components=2,
+    gmm_random_state=0,
     logger=None,
 ):
     """
-    End-to-end: collect all user features, fit models per user, aggregate scores.
+    End-to-end: collect user features, fit models per user, aggregate votes.
 
     For each (user, feature) the candidate distributions are fitted. Results are
     saved in long form. Final model choice per feature uses:
     - majority vote on per-user argmin AIC / argmin BIC
     - minimum weighted-mean AIC/BIC (weights = n_used)
     - maximum sum of log-likelihoods across users
+
+    ``fit_split``:
+    - ``train`` (default, paper-aligned): same session split as authentication_eval
+      (seed/ratios), fit clip+log1p on train only, fit/vote on train only.
+      ``best_weighted_mean_aic`` matches auth ``global_weighted_aic`` family selection
+      when the same users/seed/GMM flags are used.
+    - ``all`` (legacy descriptive): fit on full per-user corpus with per-file transform.
+
+    GMM is included only when ``include_gmm=True``.
 
     If `user_files` is provided, those paths are used instead of globbing
     `dataset_dir/dataset_pattern`.
@@ -855,6 +964,10 @@ def evaluate_all_users(
 
     def _enabled(path):
         return isinstance(path, str) and path.strip() != ""
+
+    fit_mode = str(fit_split).strip().lower()
+    if fit_mode not in ("train", "all"):
+        raise ValueError(f"Unknown fit_split={fit_split!r}; choose 'train' or 'all'")
 
     started_at = time.perf_counter()
     explicit_files = user_files is not None
@@ -876,35 +989,157 @@ def evaluate_all_users(
         sequence_break_seconds,
         session_break_seconds,
     )
+    logger.info(
+        "fit_split=%s include_gmm=%s gmm_n_components=%s",
+        fit_mode,
+        bool(include_gmm),
+        int(gmm_n_components),
+    )
+    if fit_mode == "train":
+        logger.info(
+            "Train-only vote protocol: split_seed=%s ratios=%.2f/%.2f/%.2f "
+            "(aligned with authentication_eval / global_weighted_aic)",
+            int(split_seed),
+            float(train_ratio),
+            float(val_ratio),
+            float(test_ratio),
+        )
     if preprocessed_dir and str(preprocessed_dir).strip():
         logger.info("Preprocessed JSON dir (used when file exists): %s", preprocessed_dir)
+
+    n_models = len(
+        get_model_fitters(
+            include_gmm=include_gmm,
+            gmm_n_components=gmm_n_components,
+            gmm_random_state=gmm_random_state,
+        )
+    )
 
     all_frames = []
     result_rows = []
     num_with_rows = 0
-    for idx, user_path in enumerate(user_files, start=1):
-        user_name = os.path.basename(user_path)
-        logger.info("Processing user %d/%d: %s", idx, len(user_files), user_name)
-        df_user = build_feature_df_for_user(
-            user_path,
-            preprocessed_dir=preprocessed_dir,
-            window_size=window_size,
-            stride=stride,
-            sequence_break_seconds=sequence_break_seconds,
-            session_break_seconds=session_break_seconds,
-            logger=logger,
-        )
-        if df_user.empty:
-            logger.warning("No rows produced for %s", user_name)
-            continue
-        df_user["user_file"] = user_name
-        all_frames.append(df_user)
-        num_with_rows += 1
-        logger.info("Rows from %s: %d; fitting 4 models x %d features", user_name, len(df_user), len(FEATURE_COLUMNS))
-        for feature in FEATURE_COLUMNS:
-            result_rows.extend(
-                evaluate_feature_models(feature, df_user[feature], user_file=user_name)
+    split_assignment_rows = []
+
+    if fit_mode == "train":
+        # Local imports avoid circular dependency with authentication_eval.
+        from authentication_eval import _apply_split_labels, _units_from_frame
+        from evaluation_split import build_split_assignments
+        from feature_transform import fit_transform_params, transform_features
+
+        raw_by_user = {}
+        user_units = {}
+        path_by_user = {}
+        for idx, user_path in enumerate(user_files, start=1):
+            user_name = os.path.basename(user_path)
+            uid = _infer_user_id_from_path(user_path)
+            logger.info("Loading raw features %d/%d: %s", idx, len(user_files), user_name)
+            df_raw = build_feature_df_for_user(
+                user_path,
+                preprocessed_dir=preprocessed_dir,
+                window_size=window_size,
+                stride=stride,
+                sequence_break_seconds=sequence_break_seconds,
+                session_break_seconds=session_break_seconds,
+                logger=logger,
+                apply_transform=False,
+                prefer_sessions=True,
             )
+            if df_raw.empty:
+                logger.warning("No rows produced for %s", user_name)
+                continue
+            if uid is None:
+                logger.warning("Cannot infer user_id from %s; skip", user_name)
+                continue
+            uid = int(uid)
+            raw_by_user[uid] = df_raw
+            path_by_user[uid] = user_path
+            user_units[uid] = _units_from_frame(df_raw)
+
+        if not raw_by_user:
+            raise ValueError("No feature rows produced from dataset.")
+
+        assignments = build_split_assignments(
+            user_units,
+            train_ratio=train_ratio,
+            val_ratio=val_ratio,
+            test_ratio=test_ratio,
+            seed=split_seed,
+        )
+        assignments.assert_all_disjoint()
+        split_assignment_rows = assignments.to_rows()
+
+        for uid in sorted(raw_by_user):
+            user_path = path_by_user[uid]
+            user_name = os.path.basename(user_path)
+            asg = assignments.by_user[uid]
+            labeled = _apply_split_labels(raw_by_user[uid], asg)
+            train_df = labeled[labeled["split"] == "train"]
+            if train_df.empty:
+                logger.warning("user %04d (%s): empty train after split; skip", uid, user_name)
+                continue
+            params = fit_transform_params(train_df, FEATURE_COLUMNS)
+            train_tx = transform_features(train_df, params, feature_columns=FEATURE_COLUMNS)
+            train_tx = train_tx.copy()
+            train_tx["user_file"] = user_name
+            train_tx["user_id"] = uid
+            train_tx["split"] = "train"
+            all_frames.append(train_tx)
+            num_with_rows += 1
+            logger.info(
+                "Rows from %s train: %d; fitting %d models x %d features",
+                user_name,
+                len(train_tx),
+                n_models,
+                len(FEATURE_COLUMNS),
+            )
+            for feature in FEATURE_COLUMNS:
+                result_rows.extend(
+                    evaluate_feature_models(
+                        feature,
+                        train_tx[feature],
+                        user_file=user_name,
+                        include_gmm=include_gmm,
+                        gmm_n_components=gmm_n_components,
+                        gmm_random_state=gmm_random_state,
+                    )
+                )
+    else:
+        for idx, user_path in enumerate(user_files, start=1):
+            user_name = os.path.basename(user_path)
+            logger.info("Processing user %d/%d: %s", idx, len(user_files), user_name)
+            df_user = build_feature_df_for_user(
+                user_path,
+                preprocessed_dir=preprocessed_dir,
+                window_size=window_size,
+                stride=stride,
+                sequence_break_seconds=sequence_break_seconds,
+                session_break_seconds=session_break_seconds,
+                logger=logger,
+            )
+            if df_user.empty:
+                logger.warning("No rows produced for %s", user_name)
+                continue
+            df_user["user_file"] = user_name
+            all_frames.append(df_user)
+            num_with_rows += 1
+            logger.info(
+                "Rows from %s: %d; fitting %d models x %d features",
+                user_name,
+                len(df_user),
+                n_models,
+                len(FEATURE_COLUMNS),
+            )
+            for feature in FEATURE_COLUMNS:
+                result_rows.extend(
+                    evaluate_feature_models(
+                        feature,
+                        df_user[feature],
+                        user_file=user_name,
+                        include_gmm=include_gmm,
+                        gmm_n_components=gmm_n_components,
+                        gmm_random_state=gmm_random_state,
+                    )
+                )
 
     if not all_frames:
         raise ValueError("No feature rows produced from dataset.")
@@ -919,6 +1154,10 @@ def evaluate_all_users(
         _ensure_parent_dir(output_vote_detail_csv)
     if _enabled(output_weighted_detail_csv):
         _ensure_parent_dir(output_weighted_detail_csv)
+    if _enabled(output_split_assignments_csv):
+        _ensure_parent_dir(output_split_assignments_csv)
+    if _enabled(output_run_config_json):
+        _ensure_parent_dir(output_run_config_json)
     if _enabled(output_pearson_mean_csv):
         _ensure_parent_dir(output_pearson_mean_csv)
     if _enabled(output_pearson_std_csv):
@@ -936,11 +1175,46 @@ def evaluate_all_users(
     if _enabled(output_feature_csv):
         all_features_df.to_csv(output_feature_csv, index=False)
         logger.info(
-            "Saved merged feature rows: %s (rows=%d, users_with_rows=%d)",
+            "Saved merged feature rows: %s (rows=%d, users_with_rows=%d, fit_split=%s)",
             output_feature_csv,
             len(all_features_df),
             num_with_rows,
+            fit_mode,
         )
+
+    if fit_mode == "train" and split_assignment_rows and _enabled(output_split_assignments_csv):
+        split_df = pd.DataFrame(split_assignment_rows)
+        split_df.to_csv(output_split_assignments_csv, index=False)
+        logger.info("Saved split assignments: %s", output_split_assignments_csv)
+
+    run_config = {
+        "purpose": "model_fit_vote_aggregation",
+        "fit_split": fit_mode,
+        "dataset_dir": dataset_dir,
+        "dataset_pattern": dataset_pattern,
+        "preprocessed_dir": preprocessed_dir,
+        "n_users_with_rows": int(num_with_rows),
+        "window_size": float(window_size),
+        "stride": float(stride),
+        "include_gmm": bool(include_gmm),
+        "gmm_n_components": int(gmm_n_components),
+        "gmm_random_state": int(gmm_random_state),
+        "train_ratio": float(train_ratio),
+        "val_ratio": float(val_ratio),
+        "test_ratio": float(test_ratio),
+        "split_seed": int(split_seed),
+        "notes": (
+            "fit_split=train uses authentication_eval session split + train-only "
+            "clip/log1p; best_weighted_mean_aic aligns with global_weighted_aic "
+            "family selection under the same cohort/seed/GMM settings."
+            if fit_mode == "train"
+            else "fit_split=all is legacy full-corpus descriptive fitting."
+        ),
+    }
+    if _enabled(output_run_config_json):
+        with open(output_run_config_json, "w", encoding="utf-8") as f:
+            json.dump(run_config, f, indent=2)
+        logger.info("Saved run config: %s", output_run_config_json)
 
     if not result_rows:
         raise ValueError("No model fit results were produced.")
@@ -1084,15 +1358,34 @@ def parse_args():
         choices=["descriptive", "evaluation"],
         default="descriptive",
         help=(
-            "descriptive: full-corpus model summary (legacy). "
-            "evaluation: metadata tag only here; use loss_compare --mode authentication_eval for paper eval."
+            "Metadata tag in logs. Paper auth metrics still use "
+            "loss_compare --mode authentication_eval."
         ),
     )
     p.add_argument(
         "--fit-split",
-        choices=["all", "train"],
-        default="all",
-        help="Recorded in outputs; train-only fitting for auth is done in authentication_eval.",
+        choices=["train", "all"],
+        default="train",
+        help=(
+            "train (default): session split + train-only clip/log1p, then vote "
+            "(aligned with authentication_eval / global_weighted_aic). "
+            "all: legacy full-corpus descriptive fit."
+        ),
+    )
+    p.add_argument("--split-seed", type=int, default=42, help="Split seed when --fit-split train.")
+    p.add_argument("--train-ratio", type=float, default=0.6)
+    p.add_argument("--val-ratio", type=float, default=0.2)
+    p.add_argument("--test-ratio", type=float, default=0.2)
+    p.add_argument(
+        "--include-gmm",
+        action="store_true",
+        help="Opt-in: also fit univariate GMM (sklearn) as a candidate distribution.",
+    )
+    p.add_argument(
+        "--gmm-n-components",
+        type=int,
+        default=2,
+        help="GMM mixture components when --include-gmm is set (default: 2).",
     )
     return p.parse_args()
 
@@ -1193,10 +1486,19 @@ def cli_main():
             output_feature_csv=os.path.join(tables_dir, "features_all_users_merged.csv"),
             output_qq_dir=qq_dir,
             output_qq_metrics_csv=qq_metrics_csv,
+            output_split_assignments_csv=os.path.join(tables_dir, "split_assignments.csv"),
+            output_run_config_json=os.path.join(tables_dir, "model_fit_run_config.json"),
             window_size=args.window_size,
             stride=args.stride,
             sequence_break_seconds=args.sequence_break_seconds,
             session_break_seconds=args.session_break_seconds,
+            fit_split=args.fit_split,
+            train_ratio=float(args.train_ratio),
+            val_ratio=float(args.val_ratio),
+            test_ratio=float(args.test_ratio),
+            split_seed=int(args.split_seed),
+            include_gmm=bool(args.include_gmm),
+            gmm_n_components=int(args.gmm_n_components),
             logger=logger,
         )
         logger.info("Aggregated model choice:\n%s", agg_summary.to_string(index=False))

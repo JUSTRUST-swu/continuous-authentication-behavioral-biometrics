@@ -1,6 +1,7 @@
 import argparse
 import glob
 import os
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -8,27 +9,16 @@ from scipy import stats
 
 from main import (
     FEATURE_COLUMNS,
-    _fit_gamma,
-    _fit_gaussian,
-    _fit_loglogistic,
-    _fit_lognormal,
-    _fit_student_t,
-    _fit_weibull,
     _prepare_values_for_model,
     build_feature_df_for_user,
     evaluate_feature_models,
+    get_model_fitters,
     resolve_preprocessed_json_path,
 )
 
 
-MODEL_FITTERS = {
-    "Gaussian": _fit_gaussian,
-    "Log-normal": _fit_lognormal,
-    "Gamma": _fit_gamma,
-    "Weibull": _fit_weibull,
-    "Log-logistic": _fit_loglogistic,
-    "Student-t": _fit_student_t,
-}
+# Default registry without GMM (opt-in via get_model_fitters(include_gmm=True))
+MODEL_FITTERS = get_model_fitters(include_gmm=False)
 
 
 def user_json_path(user_id, dataset_dir="./raw_kmt_dataset"):
@@ -49,14 +39,27 @@ def discover_user_ids(dataset_dir="./raw_kmt_dataset"):
     return sorted(set(user_ids))
 
 
-def select_models_by_aic_on_user(train_df):
+def select_models_by_aic_on_user(
+    train_df,
+    include_gmm=False,
+    gmm_n_components=2,
+    gmm_random_state=0,
+):
     """
-    For each FEATURE_COLUMN, fit all candidate models on the train user and
+    For each FEATURE_COLUMN, fit candidate models on the train user and
     pick the AIC-minimizing model. Returns feature -> model_name.
+
+    GMM is considered only when include_gmm=True.
     """
     model_map = {}
     for feature in FEATURE_COLUMNS:
-        rows = evaluate_feature_models(feature, train_df[feature])
+        rows = evaluate_feature_models(
+            feature,
+            train_df[feature],
+            include_gmm=include_gmm,
+            gmm_n_components=gmm_n_components,
+            gmm_random_state=gmm_random_state,
+        )
         if not rows:
             continue
         best = min(rows, key=lambda r: r["aic"])
@@ -136,18 +139,55 @@ def load_selected_models(summary_csv_path, criterion_col="best_weighted_mean_aic
     return model_map
 
 
-def fit_feature_models_on_user(train_df, model_map):
+def fit_feature_models_on_user(
+    train_df,
+    model_map,
+    include_gmm=False,
+    gmm_n_components=2,
+    gmm_random_state=0,
+):
     """
     Fit selected model per feature on training user's feature frame.
     Returns dict: feature -> fit_result from fitter.
+
+    If ``model_map`` names ``GMM`` for any feature, GMM fitting is enabled even when
+    ``include_gmm=False`` (legacy compare/API loading a GMM summary must not silently
+    drop those features). Unknown model names raise ``ValueError``.
     """
+    requested = {
+        str(model_map[f])
+        for f in FEATURE_COLUMNS
+        if f in model_map and model_map[f] is not None and str(model_map[f]).strip()
+    }
+    needs_gmm = "GMM" in requested
+    if needs_gmm and not include_gmm:
+        warnings.warn(
+            "model_map selects GMM; enabling GMM fitters automatically "
+            "(pass include_gmm=True to silence this warning).",
+            UserWarning,
+            stacklevel=2,
+        )
+        include_gmm = True
+
+    fitters = get_model_fitters(
+        include_gmm=include_gmm,
+        gmm_n_components=gmm_n_components,
+        gmm_random_state=gmm_random_state,
+    )
+    unknown = sorted(requested - set(fitters))
+    if unknown:
+        raise ValueError(
+            f"model_map references unknown model(s) {unknown}; "
+            f"known={sorted(fitters)}"
+        )
+
     fitted = {}
     for feature in FEATURE_COLUMNS:
         model_name = model_map.get(feature)
-        if model_name not in MODEL_FITTERS:
+        if model_name is None or model_name not in fitters:
             continue
         values = pd.to_numeric(train_df[feature], errors="coerce").to_numpy(dtype=float)
-        result = MODEL_FITTERS[model_name](values)
+        result = fitters[model_name](values)
         if result is not None:
             fitted[feature] = {"model": model_name, **result}
     return fitted
@@ -164,6 +204,17 @@ def _logpdf_by_model(model_name, x, params):
         return stats.weibull_min.logpdf(x, params["shape"], loc=params["loc"], scale=params["scale"])
     if model_name == "Log-logistic":
         return stats.fisk.logpdf(x, params["shape"], loc=params["loc"], scale=params["scale"])
+    if model_name == "GMM":
+        weights = np.asarray(params["weights"], dtype=float)
+        means = np.asarray(params["means"], dtype=float)
+        stds = np.asarray(params["stds"], dtype=float)
+        x = np.asarray(x, dtype=float)
+        # log p(x) = logsumexp_k [ log w_k + log N(x; mu_k, sigma_k) ]
+        comps = []
+        for w, mu, sigma in zip(weights, means, stds):
+            sigma = max(float(sigma), 1e-12)
+            comps.append(np.log(max(float(w), 1e-300)) + stats.norm.logpdf(x, loc=mu, scale=sigma))
+        return np.logaddexp.reduce(comps, axis=0)
     if model_name == "Student-t":
         return stats.t.logpdf(x, params["df"], loc=params["loc"], scale=params["scale"])
     raise ValueError(f"Unsupported model: {model_name}")
@@ -777,6 +828,17 @@ def parse_args():
         help="(authentication_eval) sliding window stride in seconds.",
     )
     parser.add_argument(
+        "--include-gmm",
+        action="store_true",
+        help="(authentication_eval) opt-in: include univariate GMM in AIC candidates.",
+    )
+    parser.add_argument(
+        "--gmm-n-components",
+        type=int,
+        default=2,
+        help="(authentication_eval) GMM components when --include-gmm is set (default: 2).",
+    )
+    parser.add_argument(
         "--logs-dir",
         type=str,
         default="./logs",
@@ -864,6 +926,8 @@ def main():
             distribution_selection=args.distribution_selection,
             window_size=args.window_size,
             stride=args.stride,
+            include_gmm=bool(args.include_gmm),
+            gmm_n_components=int(args.gmm_n_components),
         )
         print("authentication_eval summary:")
         print(result["summary"].to_string(index=False))

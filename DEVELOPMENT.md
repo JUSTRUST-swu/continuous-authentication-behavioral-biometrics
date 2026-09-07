@@ -15,11 +15,12 @@
 | Feature 추출 (dwell/flight/velocity) | 완료 | 5s window / 1s stride |
 | Preprocessed 캐시 | 완료 | schema v2에 `session_id` 권장; eval은 raw `test_N`으로도 동작 |
 | 단변량 6분포 MLE + AIC/BIC | 완료 | Gaussian, Log-normal, Gamma, Weibull, Log-logistic, Student-t |
+| `main.py` train-only vote | 완료 | 기본 `--fit-split train` (auth와 동일 split/transform) |
 | Leakage-free auth eval | 완료 | train/val/test, train-only transform/fit |
 | Decision threshold | 완료 | **기본 = validation EER** (`genuine_quantile` 옵션 유지) |
-| Modality ablation | 완료 | keyboard / mouse / all |
-| Local vs Global AIC ablation | 완료 | `run_aic_selection_ablation.py` |
-| 결과 시각화 | 완료 | `plot_modality_figures.py` |
+| Local vs Global AIC ablation | 완료 | `run_aic_selection_ablation.py` (±`--include-gmm`) |
+| GMM opt-in | 완료 | AIC 후보에 univariate GMM (K=2) |
+| 결과 시각화 | 완료 | (legacy) `plot_modality_figures.py` |
 | 단위 테스트 | 부분 | `tests/test_authentication_eval.py` |
 | 온라인 API | 동작 | 논문 숫자용 아님 (train quantile 근사) |
 | Enrollment quality gate | 미구현 | 후속 후보 |
@@ -29,9 +30,9 @@
 ### 구현 완료된 실험 산출물 (예시 경로)
 
 - `results/evaluation/` — 전체 auth eval  
-- `results/evaluation_modality/` — modality 비교 + `figures/`  
-- `results/evaluation_aic_selection/` — local vs global AIC  
-- `results/main_kmt/tables/` — 기술용 분포 fit 집계  
+- `results/evaluation_aic_selection/` — local vs global AIC (GMM 없음)  
+- `results/evaluation_aic_selection_gmm/` — local vs global AIC (+GMM)  
+- `results/main_kmt/tables/` — 논문용 분포 vote (기본 train-only; GMM 시 별도 output-dir)  
 
 ### 의도적으로 legacy로 둔 것
 
@@ -137,19 +138,23 @@ Train만으로 1–99% clip bounds 추정 → val/test에 동일 적용 → `log
 | Weibull | 2 | floc=0, x>0 |
 | Log-logistic | 2 | SciPy `fisk`, floc=0, x>0 |
 | Student-t | 3 | |
+| GMM (opt-in) | 3K−1 | `--include-gmm`; sklearn 1D mixture, default K=2 |
 
 AIC = 2k − 2ℓ, BIC = k ln n − 2ℓ.
+
+**GMM:** 기본 후보에 포함되지 않음. `--include-gmm` (및 선택 `--gmm-n-components`, 기본 2)일 때만 AIC 후보·scoring에 참여.
 
 ### 모델 선택 규칙 (헷갈리기 쉬운 부분)
 
 | 용도 | 규칙 |
 |------|------|
-| `main.py` 기술 집계 | majority / weighted AIC·BIC / sum LL **전부** 저장 |
-| Legacy API / `user_compare` | summary의 `best_weighted_mean_aic` |
+| `main.py` vote 집계 (**기본**) | `--fit-split train`: auth와 **동일** session split(seed 42, 6/2/2) + train-only clip/log1p 후 majority / weighted AIC·BIC / sum LL |
+| `main.py --fit-split all` | legacy 전 구간 descriptive fit (논문 vote 표에 비권장) |
+| Legacy API / `user_compare` | summary의 `best_weighted_mean_aic` (legacy; 맵에 GMM이 있으면 자동 enable) |
 | **`authentication_eval` 기본** | 등록자 **train local AIC** |
 | AIC ablation | `local_aic` vs `global_weighted_aic` |
 
-`global_weighted_aic`: 코호트 **train** 파티션에서 (유저별 train-only transform 후) 가중 평균 AIC로 **분포족만** 공유. 파라미터는 등록자 train에 재추정. test leakage 아님(집단 정보 공유는 Methods에 명시).
+`global_weighted_aic` / `main.py --fit-split train`의 `best_weighted_mean_aic`: 코호트 **train**에서 (유저별 train-only transform 후) 가중 평균 AIC로 **분포족** 선택. 동일 유저·seed·GMM 플래그면 둘이 일치해야 함. auth 쪽 파라미터는 등록자 train에 재추정.
 
 ---
 
@@ -159,15 +164,15 @@ AIC = 2k − 2ℓ, BIC = k ln n − 2ℓ.
 |------|------|
 | `visualize.py` | 이벤트 로드, feature, 히스토그램 |
 | `preprocess.py` | preprocessed 캐시 |
-| `main.py` | 전/단일 user 분포 fit·집계 |
+| `main.py` | 전/단일 user 분포 fit·vote (기본 train-only) |
 | `authentication_eval.py` | 논문 eval |
 | `evaluation_split.py` | split |
 | `feature_transform.py` | train-only transform |
 | `auth_metrics.py` | FAR/FRR/EER/AUC |
 | `loss_compare.py` | CLI 진입점 |
-| `run_modality_ablation.py` | modality 비교 |
-| `run_aic_selection_ablation.py` | AIC 정책 비교 |
-| `plot_modality_figures.py` | 그림 (ROC 등은 **pooled** 점수; 막대 기본 pooled) |
+| `run_aic_selection_ablation.py` | AIC 정책 비교 (`--include-gmm` 가능) |
+| `run_modality_ablation.py` | (실험 항목 제외) modality 비교 스크립트 |
+| `plot_modality_figures.py` | (legacy) modality 그림 |
 | `api_server.py` | 온라인 API |
 | `compare.py`, `data_collection.py`, `mouse_xy_ranges.py` | 유틸 |
 
@@ -180,17 +185,15 @@ AIC = 2k − 2ℓ, BIC = k ln n − 2ℓ.
 python loss_compare.py --mode authentication_eval
 python loss_compare.py --mode authentication_eval --user-range 1 5 --output-dir results/evaluation_smoke
 
-# modality / AIC ablation (동일 split seed)
-python run_modality_ablation.py
+# AIC ablation (동일 split seed); GMM 포함 시 --include-gmm
 python run_aic_selection_ablation.py
+python run_aic_selection_ablation.py --include-gmm --output-root results/evaluation_aic_selection_gmm
 
-# 그림
-python plot_modality_figures.py
-# 막대만 macro로 보고 싶을 때:
-python plot_modality_figures.py --aggregation macro
-
-# 분포 fit (descriptive)
+# 논문용 분포 vote (기본: train-only, auth와 동일 split)
 python main.py --user-range 1 88 --output-dir results/main_kmt
+python main.py --user-range 1 88 --include-gmm --output-dir results/main_kmt_gmm
+# legacy 전 구간 fit이 필요할 때만:
+python main.py --user-range 1 88 --fit-split all --output-dir results/main_kmt_all
 
 # 히스토그램
 python visualize.py --user 70
@@ -231,4 +234,4 @@ pytest -q
 - [ ] 6분포 MLE, **local AIC** (또는 global ablation 명시)  
 - [ ] Score = mean LL; threshold = **validation EER**  
 - [ ] Test: ROC-AUC, FAR/FRR@T, reporting EER  
-- [ ] Modality / AIC ablation 설정 동일 여부  
+- [ ] AIC ablation (±GMM) 설정 동일 여부  
