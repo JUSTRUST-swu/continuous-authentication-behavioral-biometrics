@@ -155,7 +155,7 @@ def plot_legend_only(
         loc="center",
         ncol=cols,
         frameon=False,
-        fontsize=11,
+        fontsize=14,
         columnspacing=1.3,
         handlelength=1.5,
         handletextpad=0.55,
@@ -309,7 +309,7 @@ def plot_vote_stacked(
                 label,
                 ha="center",
                 va="center",
-                fontsize=8,
+                fontsize=10,
                 color=text_color,
                 linespacing=1.05,
                 fontweight="semibold" if model == "GMM" else "normal",
@@ -321,8 +321,9 @@ def plot_vote_stacked(
     ax.set_yticklabels([f"{int(100 * t)}%" for t in np.linspace(0.0, 1.0, 6)])
     ax.set_xticks(x)
     ax.set_xticklabels(feature_labels, rotation=20, ha="right")
+    ax.tick_params(axis="both", labelsize=12)
     crit_label = "AIC" if criterion.endswith("aic") else "BIC"
-    ax.set_ylabel(f"사용자 비중 (다수결 투표, {crit_label})")
+    ax.set_ylabel(f"사용자 비중 (다수결 투표, {crit_label})", fontsize=14)
     ax.set_xlabel("")
     # ax.set_title(title or f"특징별 모델 선택 (100% 누적, 다수결 {crit_label})")
     ax.spines["top"].set_visible(False)
