@@ -1,4 +1,4 @@
-"""
+﻿"""
 Leakage-free authentication evaluation (paper primary path).
 
 Split at session/segment (not overlapping windows), fit clip+models on train only,
@@ -79,8 +79,8 @@ def score_user(
     Unified scoring: optional transform, then mean LL over available features.
     Does not use train-LL baseline.
     """
-    # Local import avoids circular dependency with loss_compare.
-    from loss_compare import _logpdf_by_model
+    # Local import avoids module-load cycles with compare/auth entrypoints.
+    from rne.scoring import _logpdf_by_model
 
     cols = list(feature_columns) if feature_columns is not None else list(FEATURE_COLUMNS)
     df = feature_df
@@ -139,7 +139,7 @@ def _load_raw_feature_frame(
     window_size: float = 5.0,
     stride: float = 1.0,
 ) -> pd.DataFrame:
-    from loss_compare import user_json_path
+    from rne.scoring import user_json_path
 
     uid = int(user_id)
     if cache is not None and uid in cache:
@@ -235,7 +235,7 @@ def _fit_models_for_enrollment(
     gmm_random_state: int = 0,
 ) -> Tuple[dict, Dict[str, str], List[dict]]:
     """Return fitted_models, model_map, fitted_models_rows."""
-    from loss_compare import (
+    from rne.scoring import (
         get_model_fitters,
         resolve_include_gmm_for_model_map,
         select_models_by_aic_on_user,
@@ -338,7 +338,7 @@ def _build_global_model_map_from_train(
     """
     from collections import defaultdict
 
-    from loss_compare import get_model_fitters
+    from rne.scoring import get_model_fitters
 
     fitters = get_model_fitters(
         include_gmm=include_gmm,
@@ -419,7 +419,7 @@ def run_authentication_eval(
     if threshold_mode not in ("genuine_quantile", "validation_eer"):
         raise ValueError(f"Unsupported threshold_mode={threshold_mode!r}")
 
-    from loss_compare import discover_user_ids
+    from rne.scoring import discover_user_ids
 
     all_ids = discover_user_ids(dataset_dir)
     if user_ids is None:

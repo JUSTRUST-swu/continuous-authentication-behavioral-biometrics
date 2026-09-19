@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rne"
+version = "0.1.0"
+description = "Keystroke and mouse behavioral authentication research code."
+requires-python = ">=3.9"
+dependencies = [
+  "flask",
+  "numpy",
+  "pandas",
+  "scipy",
+  "matplotlib",
+  "pytest",
+  "scikit-learn",
+]
+
+[tool.setuptools]
+packages = ["rne", "rne.plots"]

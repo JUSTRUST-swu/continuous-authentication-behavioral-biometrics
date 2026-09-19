@@ -1,4 +1,4 @@
-"""
+﻿"""
 Build per-user JSON of segmented keyboard/mouse time series (pre-5s-window).
 
 Run once, then main.py / loss_compare.py can use preprocessed JSON by default

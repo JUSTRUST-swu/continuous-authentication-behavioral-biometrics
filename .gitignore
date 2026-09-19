@@ -1,10 +1,29 @@
+# Python caches
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments / local env
 .venv/
-*.csv
-pycache/
-*.png
+venv/
+env/
+.env
+.env.*
+
+# Local datasets and logs
+raw_kmt_dataset/
+logs/
+
+# Generated experiment outputs
+results/
 qqplots/
 histograms*/
-logs/
-raw_kmt_dataset/
-results/
-__pycache__/
+*.csv
+*.png
+
+# Notebook/editor scratch
+.ipynb_checkpoints/

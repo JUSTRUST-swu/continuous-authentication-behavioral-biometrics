@@ -1,4 +1,4 @@
-"""ROC / ROC-AUC figures for local_aic vs global AIC selection."""
+﻿"""ROC / ROC-AUC figures for local_aic vs global AIC selection."""
 
 from __future__ import annotations
 

@@ -2,11 +2,11 @@
 
 코드 기준 현재 상태, 파이프라인, 데이터 split 근거, 실행·한계를 한곳에 정리한다.
 
-**논문 primary:** `python loss_compare.py --mode authentication_eval`  
+**논문 primary:** `python -m rne.compare --mode authentication_eval`  
 **연구 진행 메모:** [RESEARCH_STATUS.md](RESEARCH_STATUS.md)  
 **빠른 시작:** [README.md](README.md) · **API:** [API_SPEC.md](API_SPEC.md)
 
-최종 문서 동기화: 2026-09-07 (레이아웃 단순화 반영; keyboard/mouse modality 실험 코드·문서 제거).
+최종 문서 동기화: 2026-09-19 (GMM 기본 포함, global mean AIC 기본값 반영).
 
 ---
 
@@ -31,10 +31,11 @@
 
 ### 구현 완료된 실험 산출물 (예시)
 
-- `results/evaluation_aic_selection/` — local vs global (−GMM)  
-- `results/evaluation_aic_selection_gmm/` — local vs global (+GMM)  
+- `results/evaluation_aic_selection_gmm_not_weighted/` — local vs global mean (+GMM, 기본 비가중)
+- `results/evaluation_aic_selection_gmm/` — local vs global weighted (+GMM, `--weight-global-aic`)
+- `results/evaluation_aic_selection/` — local vs global (−GMM, `--no-include-gmm`)
 - `results/evaluation_baseline_no_gmm/`, `results/evaluation_with_gmm/` — local_aic GMM 유/무 참고  
-- `results/main_kmt_gmm/` — 논문용 분포 vote (+GMM, train-only)  
+- `results/main_kmt/` — 논문용 분포 집계 (+GMM, train-only, 기본 비가중)
 
 ### 의도적으로 legacy로 둔 것
 
@@ -57,8 +58,8 @@ raw JSON (true_data.test_1 … test_10)
   → (optional) preprocessed_kmt: gap segment + 시계열 캐시
   → sliding window 5s / stride 1s → feature 6종
   → train-only 1–99% clip + log1p
-  → 분포 6종 MLE (+ optional GMM)
-  → family 선택: local AIC 또는 global weighted AIC
+  → 분포 6종 MLE + GMM(K=2 기본)
+  → family 선택: local AIC 또는 global mean AIC
   → [논문] train fit → val EER threshold → test genuine vs impostor
   → [legacy] train_vs_rest 등
 ```
@@ -158,12 +159,12 @@ Train만으로 1–99% clip bounds 추정 → val/test에 동일 적용 → `log
 | 용도 | 규칙 |
 |------|------|
 | `authentication_eval` 기본 | 등록자 train **local AIC** |
-| AIC ablation | `local_aic` vs `global_weighted_aic` |
-| `main.py` vote (**기본**) | `--fit-split train` → majority / weighted AIC·BIC / sum LL |
+| AIC ablation | `local_aic` vs `global_weighted_aic` 내부 키 (`Global mean AIC` 기본, `--weight-global-aic` 가중) |
+| `main.py` 집계 (**기본**) | `--fit-split train` → majority / cohort mean AIC·BIC / sum LL |
 | `main.py --fit-split all` | legacy 전 구간 descriptive fit |
 | Legacy API / `user_compare` | summary의 `best_weighted_mean_aic` (GMM 맵 → 자동 enable) |
 
-`global_weighted_aic`와 `main.py`의 `best_weighted_mean_aic`는 동일 유저·seed·GMM 플래그면 **분포족**이 일치해야 함. 파라미터는 등록자 train에서 재추정.
+`global_weighted_aic`와 `main.py`의 `best_weighted_mean_aic`는 legacy 호환용 이름이다. 기본은 유저별 AIC의 **비가중 평균**이고, `--weight-global-aic`를 줄 때만 `n_used` 가중 평균이다. 동일 유저·seed·GMM·weight 플래그면 **분포족**이 일치해야 한다. 파라미터는 등록자 train에서 재추정.
 
 ---
 
@@ -184,7 +185,6 @@ Train만으로 1–99% clip bounds 추정 → val/test에 동일 적용 → `log
 | `plot_aic_selection_roc_auc.py` | AIC 정책 그림 |
 | `plot_model_vote_stacked.py` | vote stacked bar |
 | `api_server.py` | 온라인 API |
-| `data_collection.py` | 로컬 로그 수집 |
 | `tests/test_authentication_eval.py` | 단위 테스트 |
 
 ---
@@ -194,21 +194,26 @@ Train만으로 1–99% clip bounds 추정 → val/test에 동일 적용 → `log
 ```bash
 pip install -r requirements.txt
 
-python loss_compare.py --mode authentication_eval
-python loss_compare.py --mode authentication_eval --user-range 1 5 --output-dir results/evaluation_smoke
+# 최초 1회: raw JSON 파싱 캐시
+python -m rne.preprocess
 
-python run_aic_selection_ablation.py
-python run_aic_selection_ablation.py --weight-global-aic
-python run_aic_selection_ablation.py --no-include-gmm
+# 빠른 smoke
+python -m rne.compare --mode authentication_eval --user-range 1 5 --output-dir results/evaluation_smoke
 
-python plot_aic_selection_roc_auc.py --root results/evaluation_aic_selection_gmm_not_weighted
-python plot_model_vote_stacked.py --criterion both
+# 전체 재현(시간 소요; 기존 summary가 있으면 불필요한 재실행 생략)
+python -m rne.compare --mode authentication_eval
+python -m rne.ablation
+python -m rne.ablation --weight-global-aic
+python -m rne.ablation --no-include-gmm
 
-python main.py --user-range 1 88 --output-dir results/main_kmt_gmm_not_weighted
-python main.py --user-range 1 88 --no-include-gmm --output-dir results/main_kmt
-python main.py --user-range 1 88 --fit-split all --output-dir results/main_kmt_all
+python -m rne.plots.aic_selection_roc_auc --root results/evaluation_aic_selection_gmm_not_weighted
+python -m rne.plots.model_vote_stacked --input-csv results/main_kmt/tables/model_fit_aggregated_vote_counts.csv --criterion both
 
-python visualize.py --user 70
+python -m rne.modeling --user-range 1 88 --output-dir results/main_kmt
+python -m rne.modeling --user-range 1 88 --no-include-gmm --output-dir results/main_kmt_no_gmm
+python -m rne.modeling --user-range 1 88 --fit-split all --output-dir results/main_kmt_all
+
+python -m rne.features --user 70
 pytest -q
 ```
 
@@ -242,7 +247,7 @@ pytest -q
 - [x] Split = `test_N` 6/2/2, seed 42  
 - [x] Window 5s / stride 1s, feature 6종 (`all`)  
 - [x] Train-only clip + log1p  
-- [x] 6분포 MLE + local AIC; global / ±GMM ablation 실행 완료  
+- [x] 6분포+GMM MLE + local AIC; global mean / weighted / −GMM ablation 실행 완료
 - [x] Score = mean LL; threshold = **validation EER**  
 - [x] Test: ROC-AUC, FAR/FRR@T, reporting EER  
 - [ ] Methods 문장으로 고정·그림 캡션 정리  

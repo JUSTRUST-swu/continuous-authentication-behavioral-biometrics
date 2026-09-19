@@ -6,9 +6,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from auth_metrics import far_frr_at_threshold, calibrate_genuine_quantile_threshold
-from evaluation_split import make_user_split, split_group_ids
-from feature_transform import fit_transform_params, transform_features
+from rne.metrics import far_frr_at_threshold, calibrate_genuine_quantile_threshold
+from rne.splits import make_user_split, split_group_ids
+from rne.transform import fit_transform_params, transform_features
 
 
 def test_group_split_has_no_overlap():

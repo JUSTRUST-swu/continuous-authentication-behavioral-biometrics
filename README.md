@@ -40,19 +40,22 @@ pytest -q
 ## 논문용 실행 (primary)
 
 ```bash
+# raw JSON 파싱 시간을 줄이려면 최초 1회 캐시 생성
+python -m rne.preprocess
+
 # 인증 평가 (기본: validation EER, local AIC, 6분포 + GMM)
-python loss_compare.py --mode authentication_eval
+python -m rne.compare --mode authentication_eval
 
 # GMM 제외 / 성분 수 변경
-python loss_compare.py --mode authentication_eval --no-include-gmm
-python loss_compare.py --mode authentication_eval --gmm-n-components 3
+python -m rne.compare --mode authentication_eval --no-include-gmm
+python -m rne.compare --mode authentication_eval --gmm-n-components 3
 
 # local AIC vs global mean AIC (동일 split seed; 기본 GMM·비가중)
-python run_aic_selection_ablation.py
+python -m rne.ablation
 # → results/evaluation_aic_selection_gmm_not_weighted/
-python run_aic_selection_ablation.py --weight-global-aic
+python -m rne.ablation --weight-global-aic
 # → results/evaluation_aic_selection_gmm/
-python run_aic_selection_ablation.py --no-include-gmm
+python -m rne.ablation --no-include-gmm
 # → results/evaluation_aic_selection/
 ```
 
@@ -67,20 +70,22 @@ python run_aic_selection_ablation.py --no-include-gmm
 
 ---
 
-## 논문용 분포 vote (`main.py`)
+## 논문용 분포 집계 (`main.py`)
 
 인증 평가와 **동일**하게 train 파티션만 사용 (기본 `--fit-split train`, seed 42, 6/2/2).
 
 ```bash
-python main.py --user-range 1 88 --output-dir results/main_kmt_gmm_not_weighted
-python main.py --user-range 1 88 --no-include-gmm --output-dir results/main_kmt
+python -m rne.modeling --user-range 1 88 --output-dir results/main_kmt
+python -m rne.modeling --user-range 1 88 --no-include-gmm --output-dir results/main_kmt_no_gmm
 ```
 
 주요 산출 (`tables/`):
 
-- `model_fit_aggregated_summary.csv` — `best_weighted_mean_aic` ≈ auth `global_weighted_aic` family  
+- `model_fit_aggregated_summary.csv` — `best_weighted_mean_aic` ≈ auth global mean AIC family
 - `model_fit_aggregated_vote_counts.csv`  
 - `split_assignments.csv`, `model_fit_run_config.json`
+
+`best_weighted_mean_*` 컬럼명은 legacy/API 호환용이다. 기본 실행은 유저별 AIC를 **비가중 평균**하며, `--weight-global-aic`를 줄 때만 `n_used` 가중 평균을 쓴다.
 
 legacy 전 구간 fit: `--fit-split all`
 
@@ -89,9 +94,10 @@ legacy 전 구간 fit: `--fit-split all`
 ## 그림
 
 ```bash
-python plot_aic_selection_roc_auc.py --root results/evaluation_aic_selection
-python plot_aic_selection_roc_auc.py --root results/evaluation_aic_selection_gmm
-python plot_model_vote_stacked.py --input-csv results/main_kmt_gmm/tables/model_fit_aggregated_vote_counts.csv --criterion both
+python -m rne.plots.aic_selection_roc_auc --root results/evaluation_aic_selection_gmm_not_weighted
+python -m rne.plots.aic_selection_roc_auc --root results/evaluation_aic_selection_gmm
+python -m rne.plots.aic_selection_roc_auc --root results/evaluation_aic_selection
+python -m rne.plots.model_vote_stacked --input-csv results/main_kmt/tables/model_fit_aggregated_vote_counts.csv --criterion both
 ```
 
 공유 헬퍼: `plotting.py`
@@ -101,11 +107,10 @@ python plot_model_vote_stacked.py --input-csv results/main_kmt_gmm/tables/model_
 ## 보조 / legacy
 
 ```bash
-python visualize.py --user 70
-python preprocess.py
-python loss_compare.py --mode train_vs_rest --train-user 1
-python api_server.py --host 127.0.0.1 --port 3001
-python data_collection.py
+python -m rne.features --user 70
+python -m rne.preprocess  # 기본: raw_kmt_dataset → results/preprocessed_kmt
+python -m rne.compare --mode train_vs_rest --train-user 1
+python -m rne.api_server --host 127.0.0.1 --port 3001
 ```
 
 온라인 API는 논문 지표용이 아님 (train quantile 근사). 상세: [API_SPEC.md](API_SPEC.md).
@@ -123,10 +128,9 @@ python data_collection.py
 | `auth_metrics.py` | FAR/FRR/EER/ROC-AUC |
 | `main.py` | 전 user 분포 fit·vote (기본 train-only) |
 | `visualize.py` / `preprocess.py` | feature 추출·캐시 |
-| `run_aic_selection_ablation.py` | local vs global AIC (±GMM) |
+| `run_aic_selection_ablation.py` | local vs global mean/weighted AIC (±GMM) |
 | `plotting.py` | 공유 ROC/score plot 헬퍼 |
 | `plot_aic_selection_roc_auc.py` | AIC 정책 ROC / AUC 그림 |
 | `plot_model_vote_stacked.py` | 분포 vote stacked bar |
 | `api_server.py` | 온라인 train/validate |
-| `data_collection.py` | 로컬 키/마우스 로그 수집 |
 | `tests/test_authentication_eval.py` | 단위 테스트 |

@@ -76,6 +76,10 @@
   - `best_weighted_mean_bic`
   - `best_sum_log_likelihood`
 
+`best_weighted_mean_*` 이름은 legacy/API 호환용 컬럼명입니다.
+`main.py` 기본 summary는 유저별 AIC/BIC의 **비가중 평균**이고,
+`main.py --weight-global-aic`로 생성한 summary일 때만 `n_used` 가중 평균입니다.
+
 ---
 
 ### 2-1) Train (`dataType=train`)
